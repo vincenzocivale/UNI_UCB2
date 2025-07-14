@@ -82,6 +82,9 @@ class Attention(nn.Module):
         calculated_block_size = (224 // 16) * (224 // 16) + 1 # Example for 224x224, 16x16 patches
         self.register_buffer("bias", torch.tril(torch.ones(calculated_block_size, calculated_block_size))
                                             .view(1, 1, calculated_block_size, calculated_block_size))
+        
+        self.register_buffer("ucb_count_score_buffer", None)
+        self.current_block_size = None # Per tenere traccia del block_size corrente
 
 
     def transpose_for_scores(self, x):
@@ -92,26 +95,68 @@ class Attention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def UCB_Score(self, Attention_Score, beta, iter_val, v, Count_score):
+    def UCB_Score(self, Attention_Score, beta, iter_val, v, current_batch_size, current_block_size):
+      
+        if self.ucb_count_score_buffer is None or \
+           self.ucb_count_score_buffer.shape[0] != current_batch_size or \
+           self.ucb_count_score_buffer.shape[2] != current_block_size:
+            # logger.info(f"Re-initializing UCB Count Score buffer for batch_size={current_batch_size}, block_size={current_block_size}")
+            self.ucb_count_score_buffer = torch.ones(
+                current_batch_size,
+                self.num_heads,
+                current_block_size,
+                current_block_size,
+                requires_grad=False,
+            ).to(Attention_Score.device)
+            self.current_block_size = current_block_size # Aggiorna la dimensione memorizzata
 
-        num = torch.tensor(np.log(iter_val), dtype=torch.float32, device=Count_score.device)
-        score_sum = torch.sum(Count_score, dim=0)
-        
-        UCB_score = Attention_Score + beta * torch.sqrt(num / (score_sum + 1e-6))
-        
+        # Ora usa il buffer persistente interno invece di un parametro esterno
+        Count_score_internal = self.ucb_count_score_buffer
+
+        # Gestione di iter_val per evitare log(0)
+        # Se iter_val è il counter (che può essere 0 all'inizio), aggiungi un epsilon o gestiscilo
+        num = torch.tensor(np.log(iter_val) if iter_val > 0 else 0.0,
+                           dtype=torch.float32,
+                           device=Attention_Score.device) # Usa attention_score.device per coerenza
+
+        # Modifica il calcolo di score_sum per riflettere le dimensioni di Count_score_internal
+        # Se UCB_score è calcolato per ogni coppia (query_patch, key_patch) all'interno di ogni testa:
+        score_sum = Count_score_internal # In questo caso, ogni elemento di Count_score_internal è un conteggio.
+                                        # L'errore originale "score_sum = torch.sum(Count_score, dim=0)" implicava
+                                        # che la dimensione 0 dovesse scomparire, ma la tua UCB_score ha la stessa
+                                        # dimensione di Attention_Score. Se `Count_score` ha le dimensioni [B, N_H, S, S],
+                                        # allora `score_sum` deve mantenere quelle dimensioni per essere aggiunto correttamente
+                                        # ad Attention_Score o essere broadcastabile.
+
+        # Se il tuo UCB_Score è per ogni elemento dell'Attention_Score, allora `score_sum` deve avere quella forma.
+        # L'interpretazione più logica è che `Count_score_internal` stesso rappresenti i conteggi per ogni elemento.
+        # Quindi, `score_sum` dovrebbe essere semplicemente `Count_score_internal`.
+        UCB_score = Attention_Score + beta * torch.sqrt(num / (Count_score_internal + 1e-6)) # Usiamo Count_score_internal direttamente
+
+        # Attenzione al dim=3 per torch.topk
+        # Se UCB_score è [B, N_H, S, S], topk(..., dim=3) è corretto per prendere i k migliori lungo la dimensione delle key-patches.
         _, Max_Indiices = torch.topk(UCB_score, dim=3, k=10)
-        one_hot_vector = F.one_hot(Max_Indiices, num_classes=v.shape[-2]).float()
-        summed_score = one_hot_vector.sum(dim=3)
 
-        Count_score = Count_score + summed_score
-        
+        # num_classes per one_hot_vector deve essere la dimensione della dimensione 3 di UCB_score (S)
+        # Cioè, current_block_size
+        one_hot_vector = F.one_hot(Max_Indiices, num_classes=current_block_size).float()
+    
+        summed_score = one_hot_vector.sum(dim=3) # Questo dovrebbe produrre [B, N_H, S, S]
+
+        # È importante che `summed_score` abbia la stessa forma di `Count_score_internal`
+        Count_score_new = Count_score_internal + summed_score # Ho rinominato la variabile locale
+
+        # Aggiorna il buffer persistente per il prossimo passo
+        self.ucb_count_score_buffer = Count_score_new.clone().detach() # Clona e detach per impedire backprop infinite
+
         newatt = Attention_Score * summed_score
         newatt = newatt / (torch.sum(newatt, dim=3, keepdim=True) + 1e-6)
 
         update_attn = torch.matmul(newatt.float(), v)
-        return update_attn, Count_score
-
-    def forward(self, hidden_states, counter, UCB_Count_Score, ucb):
+        # Ritorna il risultato dell'attenzione aggiornata e il conteggio aggiornato
+        return update_attn, self.ucb_count_score_buffer # Ritorna il buffer aggiornato
+    
+    def forward(self, hidden_states, counter, ucb):
         B, T, C = hidden_states.size() 
 
         mixed_query_layer = self.query(hidden_states)
@@ -130,8 +175,10 @@ class Attention(nn.Module):
         
         att = self.softmax(attention_scores)
         
-        # Initialize outputs to ensure they are always tensors
-        final_count_score = UCB_Count_Score 
+        batch_size, seq_len, _ = hidden_states.shape
+        current_block_size = seq_len
+
+        
 
         if self.vis:
             weights = att.detach().clone()
@@ -139,16 +186,19 @@ class Attention(nn.Module):
             weights = torch.zeros_like(att).detach() # Dummy tensor if not visualizing
 
         if counter > 500 and ucb:
-            attention_prob_ucb, final_count_score = self.UCB_Score(
-                att,
-                Count_score=UCB_Count_Score,
-                beta=1.0,
-                iter_val=counter,
-                v=value_layer,
+            attention_probs = self.attn_dropout(att)
+            attention_output_ucb, final_count_score = self.UCB_Score(
+                attention_probs,          # Attention_Score (your attention probabilities)
+                self.beta,                # beta (assuming self.beta is defined in __init__)
+                counter,                  # iter_val (your counter for UCB)
+                value_layer,              # v (the value tensor)
+                batch_size,               # current_batch_size
+                current_block_size        # current_block_size
             )
-            context_layer = attention_prob_ucb
+            context_layer = attention_output_ucb
             
         else:
+            final_count_score = 0 
             attention_probs = self.attn_dropout(att)
             context_layer = torch.matmul(attention_probs, value_layer)
             
@@ -248,13 +298,15 @@ class Block(nn.Module):
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        self.ffn = Mlp(config)
-        self.attn = Attention(config, vis)
+        self.ffn = Mlp(config) # Assicurati che Mlp sia definito
+        self.attn = Attention(config, vis) # Assicurati che Attention sia definito
 
-    def forward(self, x, counter, UCB_Count_Score, ucb, layer_id=0):
+    def forward(self, x, counter, ucb, layer_id=0):
         h = x
         x = self.attention_norm(x)
-        x, weights, Count_Score = self.attn(x, counter, UCB_Count_Score, ucb=ucb)
+        
+        # Modifica la chiamata a self.attn: rimuovi UCB_Count_Score
+        x, weights, Count_Score = self.attn(x, counter, ucb=ucb) 
         x = x + h
 
         h = x
@@ -331,28 +383,36 @@ class Encoder(nn.Module):
             layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states, counter, UCB_Count_Score, ucb):
+    def forward(self, hidden_states, counter, ucb):
         attn_weights = []
+        final_count_score_from_last_layer = None # Inizializza per catturare l'ultimo Count_Score
         for i, layer_block in enumerate(self.layer):
-            hidden_states, weights, Count_Score = layer_block(
-                hidden_states, counter, UCB_Count_Score, ucb=ucb, layer_id=i
+            # Modifica la chiamata a layer_block: rimuovi UCB_Count_Score
+            hidden_states, weights, current_layer_count_score = layer_block(
+                hidden_states, counter, ucb=ucb, layer_id=i
             )
             if self.vis:
                 attn_weights.append(weights)
+            # Memorizza il Count_Score dell'ultimo strato (o aggregalo se necessario)
+            final_count_score_from_last_layer = current_layer_count_score 
+            
         encoded = self.encoder_norm(hidden_states)
-        return encoded, attn_weights, Count_Score
+        
+        # Restituisci l'ultimo Count_Score calcolato
+        return encoded, attn_weights, final_count_score_from_last_layer
 
 
 class Transformer(nn.Module):
     def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
-        self.embeddings = Embeddings(config, img_size=img_size)
+        self.embeddings = Embeddings(config, img_size=img_size) # Assicurati che Embeddings sia definito
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids, counter, UCB_Count_Score, ucb):
+    def forward(self, input_ids, counter, ucb):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights, Count_Score = self.encoder(embedding_output, counter, UCB_Count_Score, ucb=ucb)
-        return encoded, attn_weights, Count_Score
+        # Modifica la chiamata a self.encoder: rimuovi UCB_Count_Score
+        encoded, attn_weights, Count_Score = self.encoder(embedding_output, counter, ucb=ucb)
+        return encoded, attn_weights, Count_Score # Count_Score proviene da self.encoder
 
 
 class VisionTransformer(nn.Module):
@@ -367,11 +427,12 @@ class VisionTransformer(nn.Module):
         self.transformer = Transformer(config, img_size, vis)
         self.head = Linear(config.hidden_size, num_classes)
 
-    def forward(self, x, counter, UCB_Count_Score, ucb, labels=None):
-        x, attn_weights, Count_Score = self.transformer(x, counter, UCB_Count_Score, ucb=ucb)
+    def forward(self, x, counter, ucb, labels=None): # Rimosso UCB_Count_Score
+        # Modifica la chiamata a self.transformer: rimuovi UCB_Count_Score
+        x, attn_weights, Count_Score = self.transformer(x, counter, ucb=ucb)
         logits = self.head(x[:, 0])
 
-        return logits, Count_Score
+        return logits, Count_Score # Count_Score ora proviene da self.transformer
             
 
     def load_from(self, weights):

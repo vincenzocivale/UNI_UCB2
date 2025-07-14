@@ -229,7 +229,7 @@ class Trainer:
                     logits = self.model(
                         x=x,
                         counter=self.step_counter_for_ucb, # Il counter potrebbe non avere senso qui se UCB è disabilitato
-                        UCB_Count_Score=dummy_ucb_count_score,
+                        # UCB_Count_Score=dummy_ucb_count_score,
                         ucb=True # O False, a seconda della logica del tuo modello in validazione
                     )[0] # Prendi solo i logits
 
@@ -278,14 +278,14 @@ class Trainer:
         self.model.zero_grad()
         losses = AverageMeter()
 
-        block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
-        Count_Score = torch.ones(
-            self.train_loader.batch_size, # Usa il batch_size del dataloader di training
-           16, # Usa il num_heads dal config del modello
-            block_size,
-            block_size,
-            requires_grad=False,
-        ).to(self.args.device)
+        # block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
+        # Count_Score = torch.ones(
+        #     self.train_loader.batch_size, # Usa il batch_size del dataloader di training
+        #    16, # Usa il num_heads dal config del modello
+        #     block_size,
+        #     block_size,
+        #     requires_grad=False,
+        # ).to(self.args.device)
 
 
         start_time = time.time()
@@ -316,7 +316,7 @@ class Trainer:
                         x=x,
                         counter=self.step_counter_for_ucb,
                         ucb=True, # Assumi che UCB sia sempre attivo in training
-                        UCB_Count_Score=Count_Score,
+                        # UCB_Count_Score=Count_Score,
                     )
                     loss = self.loss_fct(logits, y)
 
@@ -337,7 +337,7 @@ class Trainer:
                     # Ad esempio, se il tuo modello restituisse (logits, count_output, ucb_explore_value)
                     # self.writer.log({"ucb/explore_value": ucb_explore_value.item()})
 
-                    Count_Score = count_output.clone().detach() # Aggiorna Count_Score
+                    # Count_Score = count_output.clone().detach() # Aggiorna Count_Score
 
                 loss_item = loss.mean() if self.args.n_gpu > 1 and not isinstance(self.model, DDP) else loss
                 loss_item = loss_item / self.args.gradient_accumulation_steps
