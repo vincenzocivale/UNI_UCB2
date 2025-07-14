@@ -1,2 +1,4 @@
 /wandb/*
 /output_notebook/*
+nohup.out
+*.log
