@@ -93,6 +93,11 @@ class Attention(nn.Module):
         return x.permute(0, 2, 1, 3)
 
     def UCB_Score(self, Attention_Score, beta, iter_val, v, Count_score):
+
+        print(f"DEBUG: Count_score (in UCB) min: {Count_score.min().item():.4f}, max: {Count_score.max().item():.4f}")
+        print(f"DEBUG: Count_score contains NaN: {torch.isnan(Count_score).any()}")
+        print(f"DEBUG: Count_score contains Inf: {torch.isinf(Count_score).any()}")
+
         num = torch.tensor(np.log(iter_val), dtype=torch.float32, device=Count_score.device)
         score_sum = torch.sum(Count_score, dim=0)
         

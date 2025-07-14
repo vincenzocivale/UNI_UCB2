@@ -98,5 +98,61 @@ Validating... (loss=nan): 100%|| 534/534 [00:35<00:00, 15.07it/s]
 Epoch 1 Training (350 / 10000 Steps) (loss=nan):  16%|| 349/2134 [04:35<04:50,  6.15it/s]07/14/2025 13:28:21 - INFO - src.rl.train - ***** Running Validation *****
 07/14/2025 13:28:21 - INFO - src.rl.train -   Num steps = 534
 07/14/2025 13:28:21 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:34<00:00, 15.33it/s]
+07/14/2025 13:28:56 - INFO - src.rl.train - :34<00:00, 17.02it/s]
 
-Validating... (loss=nan):  75%|| 403/534 [00:26<00:08, 15.85it/s]
+07/14/2025 13:28:56 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:28:56 - INFO - src.rl.train -   Global Steps: 350
+07/14/2025 13:28:56 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:28:56 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (400 / 10000 Steps) (loss=nan):  19%|| 399/2134 [05:19<04:42,  6.15it/s]07/14/2025 13:29:04 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:29:04 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:29:04 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:34<00:00, 15.32it/s]
+07/14/2025 13:29:39 - INFO - src.rl.train - :34<00:00, 17.17it/s]
+
+07/14/2025 13:29:39 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:29:39 - INFO - src.rl.train -   Global Steps: 400
+07/14/2025 13:29:39 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:29:39 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (450 / 10000 Steps) (loss=nan):  21%|| 449/2134 [06:02<04:49,  5.81it/s]07/14/2025 13:29:48 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:29:48 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:29:48 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:34<00:00, 15.37it/s]
+07/14/2025 13:30:23 - INFO - src.rl.train - :34<00:00, 17.04it/s]
+
+07/14/2025 13:30:23 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:30:23 - INFO - src.rl.train -   Global Steps: 450
+07/14/2025 13:30:23 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:30:23 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (500 / 10000 Steps) (loss=nan):  23%|| 499/2134 [06:46<04:32,  5.99it/s]07/14/2025 13:30:31 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:30:31 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:30:31 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:34<00:00, 15.42it/s]
+07/14/2025 13:31:06 - INFO - src.rl.train - :34<00:00, 16.55it/s]
+
+07/14/2025 13:31:06 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:31:06 - INFO - src.rl.train -   Global Steps: 500
+07/14/2025 13:31:06 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:31:06 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (550 / 10000 Steps) (loss=nan):  26%|| 549/2134 [07:34<07:07,  3.71it/s]07/14/2025 13:31:20 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:31:20 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:31:20 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [01:32<00:00,  5.79it/s]
+07/14/2025 13:32:52 - INFO - src.rl.train - :32<00:00,  5.95it/s]
+
+07/14/2025 13:32:52 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:32:52 - INFO - src.rl.train -   Global Steps: 550
+07/14/2025 13:32:52 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:32:52 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (600 / 10000 Steps) (loss=nan):  28%|| 599/2134 [09:20<07:03,  3.62it/s]07/14/2025 13:33:06 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:33:06 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:33:06 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [01:32<00:00,  5.80it/s]
+07/14/2025 13:34:38 - INFO - src.rl.train - :31<00:00,  6.00it/s]
+
+07/14/2025 13:34:38 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:34:38 - INFO - src.rl.train -   Global Steps: 600
+07/14/2025 13:34:38 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:34:38 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (627 / 10000 Steps) (loss=nan):  29%|| 627/2134 [11:00<06:47,  3.70it/s]   
