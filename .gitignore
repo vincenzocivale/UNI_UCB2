@@ -1,2 +1,2 @@
-wandb/
-output_notebook/
+/wandb/*
+/output_notebook/*
