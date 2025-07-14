@@ -11,8 +11,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 
+
 from tqdm import tqdm
 import wandb
+from contextlib import suppress
 
 
 logger = logging.getLogger(__name__)
@@ -307,28 +309,28 @@ class Trainer:
                 batch = tuple(t.to(self.args.device) for t in batch)
                 x, y = batch
 
-                with autocast() if self.args.fp16 else torch.no_grad():
-
-                    logits,  count = self.model(
+                with autocast() if self.args.fp16 else suppress(): # 'suppress' è un placeholder, o semplicemente non usare il contesto
+                    logits, count = self.model(
                         x=x,
                         counter=self.step_counter_for_ucb,
                         ucb=True,
                         UCB_Count_Score=Count_Score,
                     )
-
-                    loss = self.loss_fct(logits, y) 
-
+                    loss = self.loss_fct(logits, y)
 
                 if not isinstance(count, int):
                     # Clona e detach per evitare che i gradienti scorrano indietro in Count_Score
                     Count_Score = count.clone().detach()
 
-                loss_item = loss.mean() if self.args.n_gpu > 1 and not isinstance(self.model, DDP) else loss # Adjust for DataParallel vs DDP
-                loss_item = loss_item / self.args.gradient_accumulation_steps
+                loss_item = loss.mean() if self.args.n_gpu > 1 and not isinstance(self.model, DDP) else loss
+                # La divisione per gradient_accumulation_steps deve essere fatta sulla loss *prima* di backward()
+                # se stai accumulando i gradienti per media (come qui)
+                loss_item = loss_item / self.args.gradient_accumulation_steps # Assicurati che loss_item sia un float32 qui
 
                 if self.args.fp16:
                     self.scaler.scale(loss_item).backward()
                 else:
+                    # Ora loss_item dovrebbe avere requires_grad=True
                     loss_item.backward()
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
