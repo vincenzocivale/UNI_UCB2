@@ -184,12 +184,12 @@ class Trainer:
         if self.args.local_rank != -1:
             dist.destroy_process_group()
 
-    def validate(self, epoch: int):
+    def validate(self, epoch: int): 
         eval_losses = AverageMeter()
 
         logger.info("***** Running Validation *****")
         logger.info("  Num steps = %d", len(self.test_loader))
-        logger.info("  Batch size = %d", self.test_loader.batch_size) # Usa batch_size dal dataloader
+        logger.info("  Batch size = %d", self.test_loader.batch_size)
 
         self.model.eval()
         all_preds, all_label = [], []
@@ -204,31 +204,36 @@ class Trainer:
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(self.args.device) for t in batch)
             x, y = batch
-            with torch.no_grad():
-                # UCB_Count_Score: è importante che la dimensione del batch sia corretta
-                # Potrebbe essere necessario passare il batch_size effettivo del dataloader di test
-                # o usare x.shape[0] per la dimensione del batch corrente.
-                # Assumiamo che il modello possa gestire UCB_Count_Score per batch variabili
-                # o che non sia usato in validazione con lo stesso meccanismo.
-                # Qui usiamo un placeholder basato sul batch corrente.
+            
+            # Qui si usa torch.no_grad() per l'inferenza, il che è corretto per la validazione.
+            # L'autocast dovrebbe essere usato solo per la forward pass se args.fp16 è True.
+            with torch.no_grad(): 
+                # Assicurati che il modello accetti un batch_size variabile per UCB_Count_Score in validazione
                 current_batch_size = x.shape[0]
                 block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
+                
+                # Creazione di un UCB_Count_Score dummy per la validazione
+                # Usa self.model.config.transformer.num_heads per coerenza
                 dummy_ucb_count_score = torch.ones(
                     current_batch_size,
-                    16, # Numero di attention heads (dipende dal tuo modello)
+                    self.model.config.transformer.num_heads, # Usa il num_heads dal config del modello
                     block_size,
                     block_size,
                     requires_grad=False,
                 ).to(self.args.device)
 
-                with autocast() if self.args.fp16 else torch.no_grad():
+                # Questo blocco autocast è per la forward pass in validazione, che è corretta.
+                with autocast() if self.args.fp16 else suppress():
+                    # Se ucb=True in validazione, il modello deve gestire questa logica.
+                    # Se non vuoi che UCB influenzi la validazione, passa ucb=False o un valore che il modello interpreti.
                     logits = self.model(
                         x=x,
-                        counter=self.step_counter_for_ucb,
+                        counter=self.step_counter_for_ucb, # Il counter potrebbe non avere senso qui se UCB è disabilitato
                         UCB_Count_Score=dummy_ucb_count_score,
-                        ucb=True # o False, a seconda di come gestisci UCB in validazione
-                    )[0]
-                eval_loss = self.loss_fct(logits, y) # Usa la loss function passata
+                        ucb=True # O False, a seconda della logica del tuo modello in validazione
+                    )[0] # Prendi solo i logits
+
+                eval_loss = self.loss_fct(logits, y)
                 eval_losses.update(eval_loss.item())
 
                 preds = torch.argmax(logits, dim=-1)
@@ -256,14 +261,10 @@ class Trainer:
         self.eval_losses_history.append(eval_losses.avg)
 
         return accuracy, eval_losses.avg
-
     def train(self):
         """Train the model."""
         logger.info("***** Running training *****")
         logger.info("  Total optimization steps = %d", self.args.num_steps)
-        # Il batch size istantaneo per GPU dovrebbe essere dedotto dal dataloader,
-        # ma se è fisso e uguale per tutti i processi DDP, args.train_batch_size è ok.
-        # Altrimenti, self.train_loader.batch_size.
         logger.info("  Instantaneous batch size per GPU = %d", self.train_loader.batch_size)
         logger.info(
             "  Total train batch size (w. parallel, distributed & accumulation) = %d",
@@ -272,16 +273,15 @@ class Trainer:
             * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1),
         )
         logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
+ 
 
         self.model.zero_grad()
         losses = AverageMeter()
 
-        # Inizializza Count_Score, usando il batch_size effettivo del dataloader di training
-        # Assumendo che sia costante per il training
         block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
         Count_Score = torch.ones(
             self.train_loader.batch_size, # Usa il batch_size del dataloader di training
-            16, # Numero di attention heads (dipende dal tuo modello)
+           16, # Usa il num_heads dal config del modello
             block_size,
             block_size,
             requires_grad=False,
@@ -289,8 +289,6 @@ class Trainer:
 
 
         start_time = time.time()
-        # Il loop esterno può essere basato su epoche o su `num_steps`.
-        # Dato che `num_steps` è il totale, useremo un loop while per i global_step.
         epoch_idx = 0
         while self.global_step < self.args.num_steps:
             self.model.train()
@@ -303,34 +301,50 @@ class Trainer:
             )
             for step, batch in enumerate(epoch_iterator):
                 if self.global_step >= self.args.num_steps:
-                    break # Break inner loop if total steps reached
+                    break
 
                 self.step_counter_for_ucb += 1
                 batch = tuple(t.to(self.args.device) for t in batch)
                 x, y = batch
 
-                with autocast() if self.args.fp16 else suppress(): # 'suppress' è un placeholder, o semplicemente non usare il contesto
-                    logits, count = self.model(
+                # Removed DEBUG prints for x and y, assume they are now good
+                # If NaNs reappear, re-enable them for debugging.
+
+                with autocast() if self.args.fp16 else suppress():
+                    # Pass ucb=True per abilitare la logica UCB
+                    logits, count_output = self.model( # Rinominato 'count' per evitare conflitto con il metodo .count() di Python
                         x=x,
                         counter=self.step_counter_for_ucb,
-                        ucb=True,
+                        ucb=True, # Assumi che UCB sia sempre attivo in training
                         UCB_Count_Score=Count_Score,
                     )
                     loss = self.loss_fct(logits, y)
 
-                if not isinstance(count, int):
-                    # Clona e detach per evitare che i gradienti scorrano indietro in Count_Score
-                    Count_Score = count.clone().detach()
+                # Controllo e logging UCB
+                # Assumiamo che 'count_output' sia un tensore rilevante per UCB quando ucb=True
+                # e sia l'output che useresti per aggiornare Count_Score
+                if not isinstance(count_output, int) and self.args.is_main_process():
+                    # Esempio di logging per UCB_Count_Score e altri valori UCB rilevanti
+                    # Ad esempio, potresti voler loggare min/max/mean di count_output
+                    # o se il tuo modello restituisce un "UCB score" specifico
+                    self.writer.log({
+                        "ucb/count_output_min": count_output.min().item(),
+                        "ucb/count_output_max": count_output.max().item(),
+                        "ucb/count_output_mean": count_output.mean().item(),
+                        "global_step": self.global_step
+                    })
+                    # Se il modello restituisce anche un valore di "esplorazione" o "exploit" per l'UCB, loggalo qui
+                    # Ad esempio, se il tuo modello restituisse (logits, count_output, ucb_explore_value)
+                    # self.writer.log({"ucb/explore_value": ucb_explore_value.item()})
+
+                    Count_Score = count_output.clone().detach() # Aggiorna Count_Score
 
                 loss_item = loss.mean() if self.args.n_gpu > 1 and not isinstance(self.model, DDP) else loss
-                # La divisione per gradient_accumulation_steps deve essere fatta sulla loss *prima* di backward()
-                # se stai accumulando i gradienti per media (come qui)
-                loss_item = loss_item / self.args.gradient_accumulation_steps # Assicurati che loss_item sia un float32 qui
+                loss_item = loss_item / self.args.gradient_accumulation_steps
 
                 if self.args.fp16:
                     self.scaler.scale(loss_item).backward()
                 else:
-                    # Ora loss_item dovrebbe avere requires_grad=True
                     loss_item.backward()
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
@@ -363,16 +377,22 @@ class Trainer:
                             "global_step": self.global_step
                         })
 
+ 
                     if self.global_step % self.args.eval_every == 0 and self.args.is_main_process():
-                        accuracy, eval_loss = self.validate(self.step_counter_for_ucb)
+                        accuracy, eval_loss = self.validate(self.step_counter_for_ucb) # Pass step_counter_for_ucb to valid for logging consistency
                         self.train_losses_history.append(losses.avg)
 
                         if self.best_acc < accuracy:
                             self._save_model()
                             self.best_acc = accuracy
-                        self.model.train()
+                        self.model.train() # Set model back to train mode
 
-            epoch_idx += 1
+                if self.global_step >= self.args.num_steps:
+                    break # Break inner loop if total steps reached
+
+            if self.global_step >= self.args.num_steps:
+                break # Break outer loop if total steps reached
+
             losses.reset() # Reset epoch losses
 
         end_time = time.time()
@@ -386,7 +406,6 @@ class Trainer:
             np.save(os.path.join(self.args.output_dir, "eval_losses.npy"), np.array(self.eval_losses_history))
 
         self._cleanup_distributed()
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
