@@ -1,0 +1,6 @@
+{"time":"2025-07-14T12:02:28.276491632+02:00","level":"INFO","msg":"stream: starting","core version":"0.21.0"}
+{"time":"2025-07-14T12:02:28.619231596+02:00","level":"INFO","msg":"stream: created new stream","id":"tvn4nu6l"}
+{"time":"2025-07-14T12:02:28.619315765+02:00","level":"INFO","msg":"stream: started","id":"tvn4nu6l"}
+{"time":"2025-07-14T12:02:28.619385366+02:00","level":"INFO","msg":"writer: Do: started","stream_id":"tvn4nu6l"}
+{"time":"2025-07-14T12:02:28.619921944+02:00","level":"INFO","msg":"handler: started","stream_id":"tvn4nu6l"}
+{"time":"2025-07-14T12:02:28.620037432+02:00","level":"INFO","msg":"sender: started","stream_id":"tvn4nu6l"}

@@ -1,0 +1,102 @@
+/home/vcivale/UNI_UCB2/src/rl/train.py:122: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = GradScaler() if self.args.fp16 else None
+07/14/2025 13:23:45 - INFO - src.rl.train - Training arguments: TrainingArguments(
+    name = vit_training_notebook_run,
+    output_dir = ./output_notebook,
+    eval_every = 50,
+    learning_rate = 0.03,
+    weight_decay = 0.0,
+    num_steps = 10000,
+    decay_type = cosine,
+    warmup_steps = 500,
+    max_grad_norm = 1.0,
+    local_rank = -1,
+    seed = 42,
+    gradient_accumulation_steps = 1,
+    fp16 = True,
+    num_classes = 6,
+    img_size = 224,
+    train_batch_size = 8,
+    n_gpu = 1,
+    device = cuda:0,
+)
+07/14/2025 13:23:45 - INFO - src.rl.train - Total parameters: 303.3M
+07/14/2025 13:23:45 - INFO - src.rl.train - ***** Running training *****
+07/14/2025 13:23:45 - INFO - src.rl.train -   Total optimization steps = 10000
+07/14/2025 13:23:45 - INFO - src.rl.train -   Instantaneous batch size per GPU = 8
+07/14/2025 13:23:45 - INFO - src.rl.train -   Total train batch size (w. parallel, distributed & accumulation) = 8
+07/14/2025 13:23:45 - INFO - src.rl.train -   Gradient Accumulation steps = 1
+Epoch 1 Training (0 / 10000 Steps) (loss=X.X):   0%|| 0/2134 [00:00<?, ?it/s]/home/vcivale/UNI_UCB2/src/rl/train.py:310: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast() if self.args.fp16 else torch.no_grad():
+/home/vcivale/UNI_UCB2/.venv/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:182: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  warnings.warn(
+Epoch 1 Training (1 / 10000 Steps) (loss=nan):   0%|| 0/2134 [00:02<?, ?it/s]/home/vcivale/UNI_UCB2/.venv/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:332: UserWarning: To get the last learning rate computed by the scheduler, please use `get_last_lr()`.
+  _warn_get_lr_called_within_step(self)
+Epoch 1 Training (50 / 10000 Steps) (loss=nan):   2%|| 49/2134 [00:09<05:32,  6.28it/s]07/14/2025 13:23:55 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:23:55 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:23:55 - INFO - src.rl.train -   Batch size = 8
+                                                       /home/vcivale/UNI_UCB2/src/rl/train.py:222: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast() if self.args.fp16 else torch.no_grad():
+Validating... (loss=nan): 100%|| 534/534 [00:36<00:00, 14.73it/s]
+07/14/2025 13:24:31 - INFO - src.rl.train - :36<00:00, 16.67it/s]
+
+07/14/2025 13:24:31 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:24:31 - INFO - src.rl.train -   Global Steps: 50
+07/14/2025 13:24:31 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:24:31 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+07/14/2025 13:24:33 - INFO - src.rl.train - Saved model checkpoint to [DIR: ./output_notebook]
+Epoch 1 Training (100 / 10000 Steps) (loss=nan):   5%|| 99/2134 [00:55<05:18,  6.39it/s]07/14/2025 13:24:41 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:24:41 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:24:41 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:35<00:00, 14.85it/s]
+07/14/2025 13:25:17 - INFO - src.rl.train - :35<00:00, 16.12it/s]
+
+07/14/2025 13:25:17 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:25:17 - INFO - src.rl.train -   Global Steps: 100
+07/14/2025 13:25:17 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:25:17 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (150 / 10000 Steps) (loss=nan):   7%|| 149/2134 [01:39<05:13,  6.33it/s]07/14/2025 13:25:25 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:25:25 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:25:25 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:35<00:00, 15.06it/s]
+07/14/2025 13:26:00 - INFO - src.rl.train - :35<00:00, 16.69it/s]
+
+07/14/2025 13:26:00 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:26:00 - INFO - src.rl.train -   Global Steps: 150
+07/14/2025 13:26:00 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:26:00 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (200 / 10000 Steps) (loss=nan):   9%|| 199/2134 [02:23<05:13,  6.18it/s]07/14/2025 13:26:08 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:26:08 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:26:08 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:36<00:00, 14.74it/s]
+07/14/2025 13:26:45 - INFO - src.rl.train - :36<00:00, 15.96it/s]
+
+07/14/2025 13:26:45 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:26:45 - INFO - src.rl.train -   Global Steps: 200
+07/14/2025 13:26:45 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:26:45 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (250 / 10000 Steps) (loss=nan):  12%|| 249/2134 [03:07<05:03,  6.21it/s]07/14/2025 13:26:53 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:26:53 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:26:53 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:35<00:00, 15.01it/s]
+07/14/2025 13:27:28 - INFO - src.rl.train - :35<00:00, 16.11it/s]
+
+07/14/2025 13:27:28 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:27:28 - INFO - src.rl.train -   Global Steps: 250
+07/14/2025 13:27:28 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:27:28 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (300 / 10000 Steps) (loss=nan):  14%|| 299/2134 [03:51<05:28,  5.58it/s]07/14/2025 13:27:37 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:27:37 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:27:37 - INFO - src.rl.train -   Batch size = 8
+Validating... (loss=nan): 100%|| 534/534 [00:35<00:00, 15.07it/s]
+07/14/2025 13:28:12 - INFO - src.rl.train - :35<00:00, 16.24it/s]
+
+07/14/2025 13:28:12 - INFO - src.rl.train - ***** Validation Results *****
+07/14/2025 13:28:12 - INFO - src.rl.train -   Global Steps: 300
+07/14/2025 13:28:12 - INFO - src.rl.train -   Valid Loss: nan
+07/14/2025 13:28:12 - INFO - src.rl.train -   Valid Accuracy: 0.13147
+Epoch 1 Training (350 / 10000 Steps) (loss=nan):  16%|| 349/2134 [04:35<04:50,  6.15it/s]07/14/2025 13:28:21 - INFO - src.rl.train - ***** Running Validation *****
+07/14/2025 13:28:21 - INFO - src.rl.train -   Num steps = 534
+07/14/2025 13:28:21 - INFO - src.rl.train -   Batch size = 8
+
+Validating... (loss=nan):  75%|| 403/534 [00:26<00:08, 15.85it/s]
