@@ -216,7 +216,7 @@ class Trainer:
                 # Usa self.model.config.transformer.num_heads per coerenza
                 dummy_ucb_count_score = torch.ones(
                     current_batch_size,
-                    self.model.config.transformer.num_heads, # Usa il num_heads dal config del modello
+                    16, # Usa il num_heads dal config del modello
                     block_size,
                     block_size,
                     requires_grad=False,
