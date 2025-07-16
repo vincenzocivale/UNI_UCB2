@@ -2,7 +2,9 @@ import logging
 import os
 import random
 import time
-from datetime import timedelta
+from datetime import timedelta, datetime # Importa datetime
+from contextlib import suppress
+import sys # Importa sys per StreamHandler
 
 import numpy as np
 import torch
@@ -11,10 +13,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 
-
 from tqdm import tqdm
 import wandb
-from contextlib import suppress
+import math # Importa math per le schedule
 
 
 logger = logging.getLogger(__name__)
@@ -24,12 +25,15 @@ class TrainingArguments:
     Arguments for configuring the training process.
     """
     def __init__(self, **kwargs):
-        self.name: str = kwargs.pop("name", "default_run")
+        # Modifiche qui
+        self.project_name: str = kwargs.pop("project_name", "vision-transformer-training") # Nuovo parametro: nome del progetto W&B
+        self.name: str = kwargs.pop("name", None) # Sarà generato se None
         self.output_dir: str = kwargs.pop("output_dir", "output")
         self.eval_every: int = kwargs.pop("eval_every", 100)
         self.learning_rate: float = kwargs.pop("learning_rate", 3e-2)
         self.weight_decay: float = kwargs.pop("weight_decay", 0.0)
         self.num_steps: int = kwargs.pop("num_steps", 10000)
+        self.num_train_epochs: float = kwargs.pop("num_train_epochs", 3.0)
         self.decay_type: str = kwargs.pop("decay_type", "cosine")
         self.warmup_steps: int = kwargs.pop("warmup_steps", 500)
         self.max_grad_norm: float = kwargs.pop("max_grad_norm", 1.0)
@@ -38,30 +42,40 @@ class TrainingArguments:
         self.gradient_accumulation_steps: int = kwargs.pop("gradient_accumulation_steps", 1)
         self.fp16: bool = kwargs.pop("fp16", False)
         self.num_classes: int = kwargs.pop("num_classes", 21843)
+        self.logging_steps: int = kwargs.pop("logging_steps", 50)
 
-        # Parametri per il logging o per le dimensioni se non specificati dal modello/dataloader
-        self.img_size: int = kwargs.pop("img_size", 224) # Utile per UCB_Count_Score
-        self.train_batch_size: int = kwargs.pop("train_batch_size", 64) # Necessario per UCB_Count_Score
+        self.img_size: int = kwargs.pop("img_size", 224)
+        self.train_batch_size: int = kwargs.pop("train_batch_size", 64)
 
-        # Derived properties (verranno impostate in _setup_device)
         self.n_gpu: int = 0
         self.device: torch.device = None
 
         self._setup_device()
         self._setup_logging()
 
+        # Genera il nome della run solo dopo che il logger è stato configurato e il processo è il main
+        if self.name is None:
+            self.name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_run"
+            logger.info(f"Run name automatically set to: {self.name}")
+
+
     def _setup_device(self):
-        # Questa logica ora gestirà solo il caso non-DDP (local_rank == -1)
-        # Se vuoi specificare una GPU precisa (es. cuda:0) anche se ce ne sono più disponibili
-        if torch.cuda.is_available():
-    
-            self.device = torch.device("cuda:0") # Usa esplicitamente la GPU con indice 0
-            self.n_gpu = 1 # Stiamo usando una singola GPU
-            logger.info(f"Using single GPU: {self.device}")
+        if self.local_rank == -1:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda:0")
+                self.n_gpu = 1
+                logger.info(f"Using single GPU or DataParallel: {self.device}")
+            else:
+                self.device = torch.device("cpu")
+                self.n_gpu = 0
+                logger.info("CUDA is not available, using CPU.")
         else:
-            self.device = torch.device("cpu")
-            self.n_gpu = 0
-            logger.info("CUDA is not available, using CPU.")
+            torch.cuda.set_device(self.local_rank)
+            self.device = torch.device("cuda", self.local_rank)
+            dist.init_process_group(backend="nccl")
+            self.n_gpu = 1
+            logger.info(f"Using DistributedDataParallel on GPU: {self.device}")
+
 
         logger.warning(
             f"Process rank: {self.local_rank}, device: {self.device}, n_gpu: {self.n_gpu}, "
@@ -73,6 +87,7 @@ class TrainingArguments:
             format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
             datefmt="%m/%d/%Y %H:%M:%S",
             level=logging.INFO if self.is_main_process() else logging.WARN,
+            handlers=[logging.StreamHandler(sys.stdout)],
         )
 
     def is_main_process(self) -> bool:
@@ -85,6 +100,28 @@ class TrainingArguments:
         s += ")"
         return s
 
+# Definisci le classi WarmupCosineSchedule e WarmupLinearSchedule (come nel tuo codice originale)
+class WarmupCosineSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, t_total, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.t_total = t_total
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * (float(self.last_epoch) / self.warmup_steps) for base_lr in self.base_lrs]
+        return [base_lr * 0.5 * (1.0 + math.cos(math.pi * (float(self.last_epoch) - self.warmup_steps) / (self.t_total - self.warmup_steps))) for base_lr in self.base_lrs]
+
+class WarmupLinearSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, t_total, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.t_total = t_total
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * (float(self.last_epoch) / self.warmup_steps) for base_lr in self.base_lrs]
+        return [base_lr * max(0.0, float(self.t_total - self.last_epoch) / (self.t_total - self.warmup_steps)) for base_lr in self.base_lrs]
 
 class Trainer:
     def __init__(
@@ -94,20 +131,21 @@ class Trainer:
         train_dataloader: torch.utils.data.DataLoader,
         eval_dataloader: torch.utils.data.DataLoader,
         loss_function: nn.Module,
-        optimizer: torch.optim.Optimizer = None, # Possibilità di passare un optimizer predefinito
-        scheduler: torch.optim.lr_scheduler._LRScheduler = None # Possibilità di passare uno scheduler predefinito
+        optimizer: torch.optim.Optimizer = None,
+        scheduler: torch.optim.lr_scheduler._LRScheduler = None
     ):
         self.args = args
         self._set_seed(self.args)
 
         if self.args.is_main_process():
             os.makedirs(self.args.output_dir, exist_ok=True)
-            wandb.init(project="vision-transformer-training", name=self.args.name, config=vars(self.args))
+            # Usa self.args.project_name e self.args.name
+            wandb.init(project=self.args.project_name, name=self.args.name, config=vars(self.args))
             self.writer = wandb
         else:
             self.writer = None
 
-        self.model = model.to(self.args.device) # Sposta il modello sul device
+        self.model = model.to(self.args.device)
         if self.args.local_rank != -1:
             self.model = DDP(self.model, device_ids=[self.args.local_rank])
         elif self.args.n_gpu > 1:
@@ -117,6 +155,10 @@ class Trainer:
         self.train_loader = train_dataloader
         self.test_loader = eval_dataloader
         self.loss_fct = loss_function
+
+        self.num_training_steps_per_epoch = len(self.train_loader) // self.args.gradient_accumulation_steps
+        self.args.num_steps = int(self.args.num_train_epochs * self.num_training_steps_per_epoch)
+        logger.info(f"Calculated total training steps: {self.args.num_steps} over {self.args.num_train_epochs} epochs.")
 
         self.optimizer = optimizer if optimizer else self._setup_optimizer()
         self.scheduler = scheduler if scheduler else self._setup_scheduler(self.optimizer)
@@ -131,7 +173,6 @@ class Trainer:
 
         logger.info("Training arguments: %s", self.args)
         logger.info("Total parameters: %2.1fM" % self._count_parameters(self.model))
-        # logger.info("Model configuration: %s", CONFIGS[self.args.model_type]) # Non più necessario se il modello è esterno
 
 
     @staticmethod
@@ -152,7 +193,6 @@ class Trainer:
         return (preds == labels).mean()
 
     def _setup_optimizer(self):
-        # Questo metodo viene usato solo se l'optimizer non è stato passato esternamente
         optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=self.args.learning_rate,
@@ -162,7 +202,6 @@ class Trainer:
         return optimizer
 
     def _setup_scheduler(self, optimizer):
-        # Questo metodo viene usato solo se lo scheduler non è stato passato esternamente
         t_total = self.args.num_steps
         if self.args.decay_type == "cosine":
             scheduler = WarmupCosineSchedule(
@@ -184,18 +223,18 @@ class Trainer:
         if self.args.local_rank != -1:
             dist.destroy_process_group()
 
-    def validate(self, epoch: int): 
+    def validate(self, epoch: int):
         eval_losses = AverageMeter()
 
-        logger.info("***** Running Validation *****")
-        logger.info("  Num steps = %d", len(self.test_loader))
+        logger.info(f"***** Running Validation for Epoch {epoch} *****")
+        logger.info("  Num examples = %d", len(self.test_loader.dataset) if hasattr(self.test_loader, 'dataset') else len(self.test_loader) * self.test_loader.batch_size)
         logger.info("  Batch size = %d", self.test_loader.batch_size)
 
         self.model.eval()
         all_preds, all_label = [], []
         epoch_iterator = tqdm(
             self.test_loader,
-            desc="Validating... (loss=X.X)",
+            desc=f"Validating Epoch {epoch}... (loss=X.X)",
             bar_format="{l_bar}{r_bar}",
             dynamic_ncols=True,
             disable=not self.args.is_main_process(),
@@ -204,34 +243,27 @@ class Trainer:
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(self.args.device) for t in batch)
             x, y = batch
-            
-            # Qui si usa torch.no_grad() per l'inferenza, il che è corretto per la validazione.
-            # L'autocast dovrebbe essere usato solo per la forward pass se args.fp16 è True.
-            with torch.no_grad(): 
-                # Assicurati che il modello accetti un batch_size variabile per UCB_Count_Score in validazione
+
+            with torch.no_grad():
                 current_batch_size = x.shape[0]
                 block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
-                
-                # Creazione di un UCB_Count_Score dummy per la validazione
-                # Usa self.model.config.transformer.num_heads per coerenza
+
+                num_heads = 16 # Esempio, adatta questo al tuo modello
+
                 dummy_ucb_count_score = torch.ones(
                     current_batch_size,
-                    16, # Usa il num_heads dal config del modello
+                    num_heads,
                     block_size,
                     block_size,
                     requires_grad=False,
                 ).to(self.args.device)
 
-                # Questo blocco autocast è per la forward pass in validazione, che è corretta.
                 with autocast() if self.args.fp16 else suppress():
-                    # Se ucb=True in validazione, il modello deve gestire questa logica.
-                    # Se non vuoi che UCB influenzi la validazione, passa ucb=False o un valore che il modello interpreti.
                     logits = self.model(
                         x=x,
-                        counter=self.step_counter_for_ucb, # Il counter potrebbe non avere senso qui se UCB è disabilitato
-                        # UCB_Count_Score=dummy_ucb_count_score,
-                        ucb=True # O False, a seconda della logica del tuo modello in validazione
-                    )[0] # Prendi solo i logits
+                        counter=self.step_counter_for_ucb,
+                        ucb=False,
+                    )[0]
 
                 eval_loss = self.loss_fct(logits, y)
                 eval_losses.update(eval_loss.item())
@@ -240,30 +272,28 @@ class Trainer:
 
             all_preds.append(preds.detach().cpu().numpy())
             all_label.append(y.detach().cpu().numpy())
-            epoch_iterator.set_description(f"Validating... (loss={eval_losses.val:.5f})")
+            epoch_iterator.set_description(f"Validating Epoch {epoch}... (loss={eval_losses.val:.5f})")
 
         all_preds_np = np.concatenate(all_preds, axis=0)
         all_label_np = np.concatenate(all_label, axis=0)
         accuracy = self._simple_accuracy(all_preds_np, all_label_np)
 
-        logger.info("\n")
-        logger.info("***** Validation Results *****")
-        logger.info("  Global Steps: %d", self.global_step)
-        logger.info("  Valid Loss: %2.5f", eval_losses.avg)
-        logger.info("  Valid Accuracy: %2.5f", accuracy)
-
         if self.args.is_main_process():
             self.writer.log({
                 "eval/loss": eval_losses.avg,
                 "eval/accuracy": accuracy,
-                "global_step": self.global_step
+                "global_step": self.global_step,
+                "epoch": epoch,
             })
-        self.eval_losses_history.append(eval_losses.avg)
+            logger.info(f"Epoch {epoch} - Global Steps: {self.global_step} - Valid Loss: {eval_losses.avg:.5f} - Valid Accuracy: {accuracy:.5f}")
 
+        self.eval_losses_history.append(eval_losses.avg)
         return accuracy, eval_losses.avg
+
     def train(self):
         """Train the model."""
         logger.info("***** Running training *****")
+        logger.info("  Total training epochs = %d", self.args.num_train_epochs)
         logger.info("  Total optimization steps = %d", self.args.num_steps)
         logger.info("  Instantaneous batch size per GPU = %d", self.train_loader.batch_size)
         logger.info(
@@ -273,32 +303,30 @@ class Trainer:
             * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1),
         )
         logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
- 
 
         self.model.zero_grad()
-        losses = AverageMeter()
-
-        # block_size = (self.args.img_size * self.args.img_size) // (16 * 16) + 1
-        # Count_Score = torch.ones(
-        #     self.train_loader.batch_size, # Usa il batch_size del dataloader di training
-        #    16, # Usa il num_heads dal config del modello
-        #     block_size,
-        #     block_size,
-        #     requires_grad=False,
-        # ).to(self.args.device)
-
+        train_losses = AverageMeter()
 
         start_time = time.time()
-        epoch_idx = 0
-        while self.global_step < self.args.num_steps:
+        completed_epochs = 0
+        steps_trained_this_epoch = 0
+
+        for epoch_idx in range(int(self.args.num_train_epochs)):
+            if self.global_step >= self.args.num_steps:
+                break
+
             self.model.train()
             epoch_iterator = tqdm(
                 self.train_loader,
-                desc=f"Epoch {epoch_idx+1} Training ({self.global_step} / {self.args.num_steps} Steps) (loss=X.X)",
+                desc=f"Epoch {epoch_idx+1}/{int(self.args.num_train_epochs)} Training ({self.global_step} / {self.args.num_steps} Steps) (Loss: X.X)",
                 bar_format="{l_bar}{r_bar}",
                 dynamic_ncols=True,
                 disable=not self.args.is_main_process(),
             )
+            
+            train_losses.reset()
+            steps_trained_this_epoch = 0
+
             for step, batch in enumerate(epoch_iterator):
                 if self.global_step >= self.args.num_steps:
                     break
@@ -307,37 +335,16 @@ class Trainer:
                 batch = tuple(t.to(self.args.device) for t in batch)
                 x, y = batch
 
-                # Removed DEBUG prints for x and y, assume they are now good
-                # If NaNs reappear, re-enable them for debugging.
-
                 with autocast() if self.args.fp16 else suppress():
-                    # Pass ucb=True per abilitare la logica UCB
-                    logits, count_output = self.model( # Rinominato 'count' per evitare conflitto con il metodo .count() di Python
+                    model_output = self.model(
                         x=x,
                         counter=self.step_counter_for_ucb,
-                        ucb=True, # Assumi che UCB sia sempre attivo in training
-                        # UCB_Count_Score=Count_Score,
+                        ucb=True,
                     )
+                    logits = model_output[0]
+                    count_output = model_output[1] if len(model_output) > 1 else None
+
                     loss = self.loss_fct(logits, y)
-
-                # Controllo e logging UCB
-                # Assumiamo che 'count_output' sia un tensore rilevante per UCB quando ucb=True
-                # e sia l'output che useresti per aggiornare Count_Score
-                if not isinstance(count_output, int) and self.args.is_main_process():
-                    # Esempio di logging per UCB_Count_Score e altri valori UCB rilevanti
-                    # Ad esempio, potresti voler loggare min/max/mean di count_output
-                    # o se il tuo modello restituisce un "UCB score" specifico
-                    self.writer.log({
-                        "ucb/count_output_min": count_output.min().item(),
-                        "ucb/count_output_max": count_output.max().item(),
-                        "ucb/count_output_mean": count_output.mean().item(),
-                        "global_step": self.global_step
-                    })
-                    # Se il modello restituisce anche un valore di "esplorazione" o "exploit" per l'UCB, loggalo qui
-                    # Ad esempio, se il tuo modello restituisse (logits, count_output, ucb_explore_value)
-                    # self.writer.log({"ucb/explore_value": ucb_explore_value.item()})
-
-                    # Count_Score = count_output.clone().detach() # Aggiorna Count_Score
 
                 loss_item = loss.mean() if self.args.n_gpu > 1 and not isinstance(self.model, DDP) else loss
                 loss_item = loss_item / self.args.gradient_accumulation_steps
@@ -347,7 +354,7 @@ class Trainer:
                 else:
                     loss_item.backward()
 
-                if (step + 1) % self.args.gradient_accumulation_steps == 0:
+                if (step + 1) % self.args.gradient_accumulation_steps == 0 or (step + 1) == len(self.train_loader):
                     if self.args.fp16:
                         self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(
@@ -364,36 +371,50 @@ class Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
-                    losses.update(loss_item.item() * self.args.gradient_accumulation_steps)
+                    steps_trained_this_epoch += 1
 
-                    epoch_iterator.set_description(
-                        f"Epoch {epoch_idx+1} Training ({self.global_step} / {self.args.num_steps} Steps) (loss={losses.val:.5f})"
-                    )
+                    train_losses.update(loss.item())
 
-                    if self.args.is_main_process():
+                    if self.global_step % self.args.logging_steps == 0 and self.args.is_main_process():
+                        current_lr = self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.optimizer.param_groups[0]['lr']
                         self.writer.log({
-                            "train/loss": losses.val,
-                            "train/lr": self.scheduler.get_lr()[0],
+                            "train/loss": train_losses.avg,
+                            "train/lr": current_lr,
+                            "global_step": self.global_step,
+                            "epoch": epoch_idx + 1,
+                        })
+                        logger.info(
+                            f"Epoch {epoch_idx+1} Step {self.global_step}/{self.args.num_steps} - "
+                            f"Loss: {train_losses.avg:.5f} - "
+                            f"LR: {current_lr:.6f}"
+                        )
+                        train_losses.reset()
+
+                    if not isinstance(count_output, int) and self.args.is_main_process():
+    
+                        self.writer.log({
+                            "ucb/count_output_min": count_output.min().item(),
+                            "ucb/count_output_max": count_output.max().item(),
+                            "ucb/count_output_mean": count_output.mean().item(),
                             "global_step": self.global_step
                         })
 
- 
-                    if self.global_step % self.args.eval_every == 0 and self.args.is_main_process():
-                        accuracy, eval_loss = self.validate(self.step_counter_for_ucb) # Pass step_counter_for_ucb to valid for logging consistency
-                        self.train_losses_history.append(losses.avg)
-
-                        if self.best_acc < accuracy:
-                            self._save_model()
-                            self.best_acc = accuracy
-                        self.model.train() # Set model back to train mode
+                epoch_iterator.set_description(
+                    f"Epoch {epoch_idx+1}/{int(self.args.num_train_epochs)} Training ({self.global_step} / {self.args.num_steps} Steps) (Loss: {train_losses.val:.5f})"
+                )
 
                 if self.global_step >= self.args.num_steps:
-                    break # Break inner loop if total steps reached
+                    break
 
-            if self.global_step >= self.args.num_steps:
-                break # Break outer loop if total steps reached
+            if self.args.is_main_process():
+                accuracy, eval_loss = self.validate(epoch_idx + 1)
+                self.train_losses_history.append(train_losses.avg)
+                if self.best_acc < accuracy:
+                    self._save_model()
+                    self.best_acc = accuracy
+                self.model.train()
 
-            losses.reset() # Reset epoch losses
+            completed_epochs += 1
 
         end_time = time.time()
         logger.info(f"Training finished in {timedelta(seconds=int(end_time - start_time))}")
