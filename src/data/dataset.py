@@ -18,15 +18,19 @@ class PatchFromH5Dataset(Dataset):
         self.transform = transform
 
         metadata = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_1_0.csv")
-        metadata['oncotree_code'] = metadata['oncotree_code'].fillna('Healthy')
-        metadata['oncotree_code'] = metadata['oncotree_code'].astype(str)
+        # metadata['oncotree_code'] = metadata['oncotree_code'].fillna('Healthy')
+        # metadata['oncotree_code'] = metadata['oncotree_code'].astype(str)
 
-        # Il numero di classi è 6, come previsto.
-        self.labels = ['SKCM', 'PRAD', 'COAD', 'SOC', 'CESC', 'BRCA']
-        # Filtra i metadati solo per le tue 6 classi
-        metadata = metadata[metadata['oncotree_code'].isin(self.labels)] 
+        # # Il numero di classi è 6, come previsto.
+        # self.labels = ['SKCM', 'PRAD', 'COAD', 'SOC', 'CESC', 'BRCA']
+        # # Filtra i metadati solo per le tue 6 classi
+        # metadata = metadata[metadata['oncotree_code'].isin(self.labels)] 
 
-        self.sample_to_label = dict(zip(metadata['id'], metadata['oncotree_code']))
+        # self.sample_to_label = dict(zip(metadata['id'], metadata['oncotree_code']))
+        # self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
+
+        self.labels = ['Healthy', 'Cancer']
+        self.sample_to_label = dict(zip(metadata['id'], metadata['disease_state']))
         self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
 
         self.data_index = [] 
