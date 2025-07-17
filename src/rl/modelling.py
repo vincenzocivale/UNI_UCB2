@@ -64,11 +64,10 @@ class Attention(nn.Module):
         self.proj_dropout = Dropout(config.transformer["dropout_rate"])
         self.softmax = Softmax(dim=-1)
         
-        # UCB parameters - more conservative
-        self.ucb_beta_initial = 2.0
-        self.ucb_beta_decay = 0.999
-        self.ucb_top_p = 0.9  # Keep 90% of patches initially
-        self.ucb_activation_step = 1000  # Start UCB much later
+        # Parametri UCB
+        self.ucb_beta = 1.0  # Valore fisso come nell'articolo
+        self.ucb_activation_step = 1000
+        self.ucb_top_k = 10  # Top-k fisso
         
         # Per-batch count buffers
         self.count_buffer_size = 512  # Max sequence length
@@ -139,7 +138,7 @@ class Attention(nn.Module):
         
         return selected_probs, count_buffer, current_beta
 
-    def forward(self, hidden_states, counter, ucb):
+    def forward(self, hidden_states, counter, ucb_count_score, ucb):
         B, T, C = hidden_states.size()
         
         mixed_query_layer = self.query(hidden_states)
@@ -150,38 +149,34 @@ class Attention(nn.Module):
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
-        # Raw attention scores (before softmax)
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         
-        # Store weights for visualization (without detaching)
-        weights = None
-        final_count_score = None
+        # Applica softmax prima della selezione UCB
+        att = self.softmax(attention_scores)
         
-        # Apply UCB if enabled and after activation step
         if ucb and counter >= self.ucb_activation_step:
-            # Initialize count buffer for this batch
-            count_buffer = self.initialize_count_buffer(B, T, attention_scores.device)
+            # Calcola UCB scores
+            log_t = math.log(counter)
+            ucb_scores = att + self.ucb_beta * torch.sqrt(log_t / (ucb_count_score + 1e-8))
             
-            # Apply UCB selection
-            attention_probs, count_buffer, current_beta = self.apply_ucb_selection(
-                attention_scores, count_buffer, counter
-            )
+            # Top-k selection
+            _, top_indices = torch.topk(ucb_scores, k=self.ucb_top_k, dim=-1)
+            mask = torch.zeros_like(att)
+            mask.scatter_(-1, top_indices, 1.0)
             
-            final_count_score = count_buffer.mean(dim=0)  # Average across batch
+            # Aggiorna lo stato
+            updated_ucb_count_score = ucb_count_score + mask
             
-            if self.vis:
-                weights = attention_probs.clone()
+            # Applia maschera e normalizza
+            selected_att = att * mask
+            selected_att = selected_att / (selected_att.sum(dim=-1, keepdim=True) + 1e-8)
+            attention_probs = self.attn_dropout(selected_att)
         else:
-            # Standard attention
-            attention_probs = self.softmax(attention_scores)
-            attention_probs = self.attn_dropout(attention_probs)
+            attention_probs = self.attn_dropout(att)
+            updated_ucb_count_score = ucb_count_score  # Mantieni lo stato invariato
             
-            if self.vis:
-                weights = attention_probs.clone()
-            
-            final_count_score = torch.tensor(-1.0, device=attention_scores.device)
-
+           
         # Apply attention to values
         context_layer = torch.matmul(attention_probs, value_layer)
         
@@ -194,8 +189,10 @@ class Attention(nn.Module):
         attention_output = self.out(context_layer)
         attention_output = self.proj_dropout(attention_output)
 
-        return attention_output, weights, final_count_score
+        return attention_output, attention_probs, updated_ucb_count_score
 
+
+    
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
@@ -210,11 +207,11 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
 
-    def forward(self, x, counter, ucb):
+    def forward(self, x, counter=None, ucb_count_score=None, ucb=False):
         # Pre-norm with residual connection
         h = x
         x = self.attention_norm(x)
-        x, weights, count_score = self.attn(x, counter, ucb)
+        x, weights, count_score = self.attn(x, counter=counter, ucb=ucb, ucb_count_score=ucb_count_score)
         x = x + h
 
         # FFN with residual connection
@@ -236,26 +233,30 @@ class Encoder(nn.Module):
             layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states, counter, ucb):
+    def forward(self, hidden_states, counter=None, ucb_count_score=None, ucb=False):
         attn_weights = []
-        all_count_scores = []
-        
+
+        # 'ucb_count_score' ora è lo stato per il layer corrente
+        current_layer_ucb_score = ucb_count_score 
+
         for layer_block in self.layer:
-            hidden_states, weights, count_score = layer_block(hidden_states, counter, ucb)
-            
+            hidden_states, weights, updated_ucb_score = layer_block( # Rinominato per chiarezza
+                hidden_states,
+                counter=counter,
+                ucb_count_score=current_layer_ucb_score, # Passa lo stato corrente
+                ucb=ucb
+            )
+
             if self.vis:
                 attn_weights.append(weights)
-            
-            # Collect valid count scores
-            if isinstance(count_score, torch.Tensor) and count_score.numel() > 1:
-                all_count_scores.append(count_score)
-        
+
         encoded = self.encoder_norm(hidden_states)
-        
-        # Return the last valid count score or -1
-        final_count_score = all_count_scores[-1] if all_count_scores else torch.tensor(-1.0)
-        
+
+        # Restituisce lo stato dell'ultimo layer
+        final_count_score = updated_ucb_score if ucb else torch.tensor(-1.0, device=hidden_states.device)
+
         return encoded, attn_weights, final_count_score
+
 
 class Mlp(nn.Module):
     def __init__(self, config):
@@ -340,11 +341,40 @@ class Transformer(nn.Module):
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids, counter, ucb):
+    def forward(self, input_ids, counter, ucb_count_score, ucb=False):  # Aggiungi default per ucb
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights, count_score = self.encoder(embedding_output, counter, ucb=ucb)
-        return encoded, attn_weights, count_score
+        encoded, attn_weights, updated_ucb_count_score = self.encoder(
+            hidden_states=embedding_output,
+            counter=counter,
+            ucb_count_score=ucb_count_score,
+            ucb=ucb
+        )
+        return encoded, attn_weights, updated_ucb_count_score
 
+class MlpClassifier(nn.Module):
+    def __init__(self, config, in_features, out_features): # Aggiungi in_features, out_features
+        super(MlpClassifier, self).__init__()
+        self.fc1 = Linear(in_features, config.transformer["mlp_dim"]) # in_features è ora dinamico
+        self.fc2 = Linear(config.transformer["mlp_dim"], out_features) # out_features è ora dinamico
+        self.act_fn = ACT2FN["gelu"]
+        self.dropout = Dropout(config.transformer["dropout_rate"])
+        self._init_weights() # Assicurati che _init_weights inizializzi correttamente con le nuove dimensioni
+
+    def _init_weights(self):
+        # Assicurati che queste inizializzazioni siano appropriate per le tue dimensioni
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.normal_(self.fc1.bias, std=1e-6)
+        nn.init.normal_(self.fc2.bias, std=1e-6)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act_fn(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.dropout(x)
+        return x
+    
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
@@ -352,74 +382,87 @@ class VisionTransformer(nn.Module):
         self.zero_head = zero_head
         self.classifier = config.classifier
         self.transformer = Transformer(config, img_size, vis)
-        self.head = Linear(config.hidden_size, num_classes)
+        self.head = MlpClassifier(config, in_features=config.hidden_size, out_features=self.num_classes)
 
-    def forward(self, x, counter, ucb, labels=None):
-        x, attn_weights, count_score = self.transformer(x, counter, ucb=ucb)
+         # Calcola e memorizza la dimensione del blocco
+        if config.patches.get("grid"):
+            grid_size = config.patches["grid"]
+            patch_size = (img_size // 16 // grid_size[0], img_size // 16 // grid_size[1])
+            n_patches = (img_size // 16) * (img_size // 16)
+        else:
+            patch_size = _pair(config.patches["size"])
+            n_patches = (img_size // patch_size[0]) * (img_size // patch_size[1])
+        self.block_size = n_patches + 1  # +1 per il token [CLS]
+
+    def forward(self, x, counter, ucb_count_score, ucb=True, labels=None):  # Aggiungi default per ucb
+        x, attn_weights, updated_ucb_count_score = self.transformer(
+            input_ids=x,
+            counter=counter,
+            ucb_count_score=ucb_count_score,
+            ucb=ucb
+        )
         logits = self.head(x[:, 0])
-        return logits, count_score
+        # print(f"DEBUG - VisionTransformer: logits - Mean: {logits.mean().item():.6f}, Std: {logits.std().item():.6f}, Min: {logits.min().item():.6f}, Max: {logits.max().item():.6f}")
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            return loss, updated_ucb_count_score
+        else:
+            return logits, updated_ucb_count_score
+
 
     def load_from(self, weights):
-        with torch.no_grad():
-            if self.zero_head:
-                nn.init.zeros_(self.head.weight)
-                nn.init.zeros_(self.head.bias)
-            else:
-                self.head.weight.copy_(np2th(weights["head/kernel"]).t())
-                self.head.bias.copy_(np2th(weights["head/bias"]).t())
+        # Carica gli embeddings di patch e posizione
+        self.transformer.embeddings.patch_embeddings.weight.copy_(
+            np2th(weights["embedding/kernel"], conv=True)
+        )
+        self.transformer.embeddings.position_embeddings.copy_(
+            np2th(weights["Transformer/posembed_input/pos_embedding"])
+        )
+        self.cls_token.copy_(np2th(weights["cls"]))
 
-            self.transformer.embeddings.patch_embeddings.weight.copy_(
-                np2th(weights["embedding/kernel"], conv=True)
-            )
-            self.transformer.embeddings.patch_embeddings.bias.copy_(
-                np2th(weights["embedding/bias"])
-            )
-            self.transformer.embeddings.cls_token.copy_(np2th(weights["cls"]))
-            self.transformer.encoder.encoder_norm.weight.copy_(
-                np2th(weights["Transformer/encoder_norm/scale"])
-            )
-            self.transformer.encoder.encoder_norm.bias.copy_(
-                np2th(weights["Transformer/encoder_norm/bias"])
-            )
+        # Carica i blocchi dell'encoder
+        for bname, block in self.transformer.encoder.named_children():
+            if bname.startswith("encoder_norm"): # l'ultimo LayerNorm dell'encoder
+                block.weight.copy_(np2th(weights[f"Transformer/encoder_norm/{'scale'}"]))
+                block.bias.copy_(np2th(weights[f"Transformer/encoder_norm/{'bias'}"]))
+                continue
 
-            posemb = np2th(weights["Transformer/posembed_input/pos_embedding"])
-            posemb_new = self.transformer.embeddings.position_embeddings
-            if posemb.size() == posemb_new.size():
-                self.transformer.embeddings.position_embeddings.copy_(posemb)
-            else:
-                logger.info("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
-                ntok_new = posemb_new.size(1)
+            for mname, module in block.named_children():
+                if mname == "attention_norm":
+                    module.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/LayerNorm_0/{'scale'}"]))
+                    module.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/LayerNorm_0/{'bias'}"]))
+                elif mname == "ffn_norm":
+                    module.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/LayerNorm_1/{'scale'}"]))
+                    module.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/LayerNorm_1/{'bias'}"]))
+                elif mname == "attn":
+                    # Carica i pesi di query, key, value e out projection per l'attenzione
+                    # Questi sono i layer che vuoi che siano addestrabili per il pruning UCB
+                    module.query.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/query/kernel"]).t())
+                    module.query.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/query/bias"]).t())
+                    module.key.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/key/kernel"]).t())
+                    module.key.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/key/bias"]).t())
+                    module.value.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/value/kernel"]).t())
+                    module.value.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/value/bias"]).t())
+                    module.out.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/out/kernel"]).t())
+                    module.out.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MultiHeadDotProductAttention_1/out/bias"]).t())
+                elif mname == "ffn":
+                    # Carica i pesi della Feed Forward Network
+                    module.fc1.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MlpBlock_3/Dense_0/kernel"]).t())
+                    module.fc1.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MlpBlock_3/Dense_0/bias"]).t())
+                    module.fc2.weight.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MlpBlock_3/Dense_1/kernel"]).t())
+                    module.fc2.bias.copy_(np2th(weights[f"Transformer/encoderblock_{bname}/MlpBlock_3/Dense_1/bias"]).t())
 
-                if self.classifier == "token":
-                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
-                    ntok_new -= 1
+    
+            if "head/kernel" in weights and "head/bias" in weights:
+                # Se il modello pre-addestrato include una testa E le dimensioni corrispondono, caricala.
+                # Altrimenti, ignora e usa l'inizializzazione di default della tua testa.
+                if self.head.weight.shape[0] == weights["head/kernel"].shape[0]:
+                    self.head.weight.copy_(np2th(weights["head/kernel"]).t())
+                    self.head.bias.copy_(np2th(weights["head/bias"]).t())
                 else:
-                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
-
-                gs_old = int(np.sqrt(len(posemb_grid)))
-                gs_new = int(np.sqrt(ntok_new))
-                print("load_pretrained: grid-size from %s to %s" % (gs_old, gs_new))
-                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
-
-                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
-                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
-                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
-                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
-                self.transformer.embeddings.position_embeddings.copy_(np2th(posemb))
-
-            for bname, block in self.transformer.encoder.named_children():
-                for uname, unit in block.named_children():
-                    unit.load_from(weights, n_block=uname)
-
-            if self.transformer.embeddings.hybrid:
-                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(
-                    np2th(weights["conv_root/kernel"], conv=True)
-                )
-                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
-                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
-                self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
-                self.transformer.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
-
-                for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
-                    for uname, unit in block.named_children():
-                        unit.load_from(weights, n_block=bname, n_unit=uname)
+                    # Stampa un avviso se le dimensioni della testa non corrispondono
+                    print(f"Warning: Head dimensions mismatch. Not loading pre-trained head weights. "
+                        f"Expected: {self.head.weight.shape[0]}, Found: {weights['head/kernel'].shape[0]}")
+            else:
+                print("Info: 'head/kernel' or 'head/bias' not found in pre-trained weights. Not loading pre-trained head weights.")

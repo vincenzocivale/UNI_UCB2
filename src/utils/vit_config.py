@@ -25,9 +25,6 @@ def inizialize_model(timm_pretrained_state_dict, num_classes: Optional[int] = 0)
 
     mapped_state_dict = refactor_hf_weight(timm_pretrained_state_dict, config)
 
-    try:
-        model.load_state_dict(mapped_state_dict, strict=False)
-        print("Model weights loaded successfully.")
-        return model
-    except Exception as e:
-        raise RuntimeError(f"Failed to load model weights: {e}")
+    model.load_state_dict(mapped_state_dict, strict=False)
+
+    return model
