@@ -30,25 +30,28 @@ class PatchFromH5Dataset(Dataset):
         # self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
 
         self.labels = ['Healthy', 'Cancer']
+        # Filtra i metadati solo per le classi di interesse
+        metadata = metadata[metadata['disease_state'].isin(self.labels)]
         self.sample_to_label = dict(zip(metadata['id'], metadata['disease_state']))
         self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
+        # Debug: stampa le label effettive
+        print("Unique labels in metadata:", set(metadata['disease_state']))
+        print("Labels used:", self.labels)
+        print("Sample to label mapping example:", list(self.sample_to_label.items())[:10])
 
         self.data_index = [] 
 
         for file in os.listdir(h5_dir):
             if file.endswith(".h5"):
                 sample_id = file.replace('.h5', '')
-                # Aggiungi un controllo qui per assicurarti che il sample_id abbia una label che ti interessa
                 if sample_id in self.sample_to_label:
                     h5_path = os.path.join(h5_dir, file)
                     with h5py.File(h5_path, 'r') as f:
-                        n_patches = len(f['img']) 
+                        n_patches = len(f['img'])
                         for i in range(n_patches):
-                            self.data_index.append((file, i)) 
+                            self.data_index.append((file, i))
                 else:
-                    # Opzionale: logga se un file .h5 viene saltato perché la sua label non è tra le 6
-                    # print(f"Skipping {file_name}: label not in selected classes.")
-                    pass
+                    print(f"Skipping {file}: label not in selected classes.")
     def __len__(self):
         return len(self.data_index)
 
@@ -65,10 +68,13 @@ class PatchFromH5Dataset(Dataset):
         patch = patch.astype(np.float32)
         patch = torch.tensor(patch)
 
-        if patch.ndim == 2: 
-            patch = patch.unsqueeze(0) 
-        elif patch.shape[-1] == 3: 
-            patch = patch.permute(2, 0, 1) 
+        # Debug: stampa la shape del patch
+        if patch.ndim == 2:
+            patch = patch.unsqueeze(0)
+        elif patch.shape[-1] == 3:
+            patch = patch.permute(2, 0, 1)
+        else:
+            print(f"Unexpected patch shape: {patch.shape}")
 
         if self.transform:
             patch = self.transform(patch)

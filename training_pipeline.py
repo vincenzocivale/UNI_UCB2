@@ -14,16 +14,15 @@ from src.rl.train import Trainer, TrainingArguments
 
 # %%
 NUM_STEPS = 100000 
-LEARNING_RATE = 5e-5 
+LEARNING_RATE = 0.1 
 WEIGHT_DECAY = 0.01 
 DECAY_TYPE = "cosine"
 WARMUP_STEPS = 500
 IMG_SIZE = 224
-TRAIN_BATCH_SIZE = 8 
-VAL_BATCH_SIZE = 8 
-NUM_CLASSES = 6
-EVAL_EVERY = 500 
-GRADIENT_ACCUMULATION_STEPS = 4
+TRAIN_BATCH_SIZE = 8
+VAL_BATCH_SIZE = 8
+NUM_CLASSES = 2
+GRADIENT_ACCUMULATION_STEPS = 16
 
 # %%
 HF_WEIGHTS_PATH = "/equilibrium/datasets/TCGA-histological-data/vit_weights_cache"
@@ -36,7 +35,7 @@ model = inizialize_model(timm_pretrained_state_dict, num_classes=NUM_CLASSES)
 
 # %%
 dataset = PatchFromH5Dataset(
-    h5_dir='/equilibrium/datasets/TCGA-histological-data/hest_dataset/datasets--MahmoodLab--hest/snapshots/cf37675c2006e6dfcdaa084ddeca863d21a8ddbb/patches',
+    h5_dir='/equilibrium/datasets/TCGA-histological-data/hest_patches_only/patches',
     transform=transforms.Compose([
         transforms.Resize(IMG_SIZE),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),])
@@ -60,8 +59,8 @@ train_idx, val_idx = train_test_split(
 train_dataset = Subset(dataset, train_idx)
 val_dataset = Subset(dataset, val_idx)
 
-train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=16)
-val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16)
+train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=16, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16, drop_last=True)
 
 # %%
 # Plot distribution of classes in train and val sets
@@ -106,11 +105,12 @@ else: # DECAY_TYPE == "linear"
 
 # %%
 training_params = {
-    "name": "vit_training_notebook_run",
-    "output_dir": "./output_notebook",
-    "eval_every": EVAL_EVERY, 
-    "num_steps": NUM_STEPS,
-    "learning_rate": LEARNING_RATE, # Passa l'LR se il trainer lo calcola internamente
+    "project_name": "UCB_UNI_Training", # Nuovo: Definisci il nome del progetto W&B
+    "name": None, # Nuovo: Lascia a None per generare nome run con data e ora (es. "2025-07-16_17-08-31_run")
+                   # Oppure imposta una stringa per un nome personalizzato, es: "my_custom_run_name"
+    "num_train_epochs": 500, # Nuovo: Definisci il numero di epoche (es. 5.0)
+    "logging_steps": 50, # Nuovo: Definisci ogni quanti step loggare il training
+    "learning_rate": LEARNING_RATE,
     "weight_decay": WEIGHT_DECAY,
     "decay_type": DECAY_TYPE,
     "warmup_steps": WARMUP_STEPS,
@@ -121,7 +121,7 @@ training_params = {
     "fp16": False, # Abilita o disabilita AMP
     "img_size": IMG_SIZE, # Necessario per UCB_Count_Score
     "train_batch_size": TRAIN_BATCH_SIZE, # Necessario per UCB_Count_Score
-     "num_classes": NUM_CLASSES,
+    "num_classes": NUM_CLASSES,
 }
 
 args = TrainingArguments(**training_params)
@@ -138,5 +138,8 @@ trainer = Trainer(
 
 # %%
 trainer.train()
+
+# %%
+model
 
 
