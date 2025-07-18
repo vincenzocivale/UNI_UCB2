@@ -66,8 +66,8 @@ class Attention(nn.Module):
         
         # Parametri UCB
         self.ucb_beta = 1.0  # Valore fisso come nell'articolo
-        self.ucb_activation_step = 1000
-        self.ucb_top_k = 10  # Top-k fisso
+        self.ucb_activation_step = 1000000
+        self.ucb_top_k = 80  # Top-k fisso
         
         # Per-batch count buffers
         self.count_buffer_size = 512  # Max sequence length
@@ -158,7 +158,7 @@ class Attention(nn.Module):
         if ucb and counter >= self.ucb_activation_step:
             # Calcola UCB scores
             log_t = math.log(counter)
-            ucb_scores = att + self.ucb_beta * torch.sqrt(log_t / (ucb_count_score + 1e-8))
+            ucb_scores = att + self.ucb_beta * torch.sqrt(log_t / (ucb_count_score.unsqueeze(1) + 1e-8))
             
             # Top-k selection
             _, top_indices = torch.topk(ucb_scores, k=self.ucb_top_k, dim=-1)
@@ -166,7 +166,7 @@ class Attention(nn.Module):
             mask.scatter_(-1, top_indices, 1.0)
             
             # Aggiorna lo stato
-            updated_ucb_count_score = ucb_count_score + mask
+            updated_ucb_count_score = ucb_count_score + mask.sum(dim=1) 
             
             # Applia maschera e normalizza
             selected_att = att * mask

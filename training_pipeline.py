@@ -22,7 +22,7 @@ IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 8
 VAL_BATCH_SIZE = 8
 NUM_CLASSES = 2
-GRADIENT_ACCUMULATION_STEPS = 16
+GRADIENT_ACCUMULATION_STEPS = 4
 
 # %%
 HF_WEIGHTS_PATH = "/equilibrium/datasets/TCGA-histological-data/vit_weights_cache"
@@ -108,8 +108,8 @@ training_params = {
     "project_name": "UCB_UNI_Training", # Nuovo: Definisci il nome del progetto W&B
     "name": None, # Nuovo: Lascia a None per generare nome run con data e ora (es. "2025-07-16_17-08-31_run")
                    # Oppure imposta una stringa per un nome personalizzato, es: "my_custom_run_name"
-    "num_train_epochs": 500, # Nuovo: Definisci il numero di epoche (es. 5.0)
-    "logging_steps": 50, # Nuovo: Definisci ogni quanti step loggare il training
+    "num_train_epochs": 50, # Nuovo: Definisci il numero di epoche (es. 5.0)
+    "logging_steps": 250, # Nuovo: Definisci ogni quanti step loggare il training
     "learning_rate": LEARNING_RATE,
     "weight_decay": WEIGHT_DECAY,
     "decay_type": DECAY_TYPE,
