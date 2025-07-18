@@ -6,10 +6,12 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset, DataLoader
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from src.utils.hf_utils import download_weights
-from src.utils.vit_config import inizialize_model
+# from src.utils.hf_utils import download_weights
+# from src.utils.vit_config import inizialize_model
 from src.data.dataset import PatchFromH5Dataset
-from src.rl.train import Trainer, TrainingArguments
+from src.rl.train import CustomTrainer, TrainingArguments
+
+from src.rl.modelling import ViT_UCB_Pruning
 
 
 # %%
@@ -25,13 +27,13 @@ NUM_CLASSES = 2
 GRADIENT_ACCUMULATION_STEPS = 4
 
 # %%
-HF_WEIGHTS_PATH = "/equilibrium/datasets/TCGA-histological-data/vit_weights_cache"
-weights_path = download_weights(HF_WEIGHTS_PATH)
+# HF_WEIGHTS_PATH = "/equilibrium/datasets/TCGA-histological-data/vit_weights_cache"
+# weights_path = download_weights(HF_WEIGHTS_PATH)
 
-timm_pretrained_state_dict = torch.load(weights_path, map_location="cpu")
+# timm_pretrained_state_dict = torch.load(weights_path, map_location="cpu")
 
 # %%
-model = inizialize_model(timm_pretrained_state_dict, num_classes=NUM_CLASSES)
+model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=2)
 
 # %%
 dataset = PatchFromH5Dataset(
@@ -104,42 +106,29 @@ else: # DECAY_TYPE == "linear"
     )
 
 # %%
-training_params = {
-    "project_name": "UCB_UNI_Training", # Nuovo: Definisci il nome del progetto W&B
-    "name": None, # Nuovo: Lascia a None per generare nome run con data e ora (es. "2025-07-16_17-08-31_run")
-                   # Oppure imposta una stringa per un nome personalizzato, es: "my_custom_run_name"
-    "num_train_epochs": 50, # Nuovo: Definisci il numero di epoche (es. 5.0)
-    "logging_steps": 250, # Nuovo: Definisci ogni quanti step loggare il training
-    "learning_rate": LEARNING_RATE,
-    "weight_decay": WEIGHT_DECAY,
-    "decay_type": DECAY_TYPE,
-    "warmup_steps": WARMUP_STEPS,
-    "max_grad_norm": 1.0,
-    "local_rank": -1, # Usa -1 per non distribuito in un singolo notebook
-    "seed": 42,
-    "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "fp16": False, # Abilita o disabilita AMP
-    "img_size": IMG_SIZE, # Necessario per UCB_Count_Score
-    "train_batch_size": TRAIN_BATCH_SIZE, # Necessario per UCB_Count_Score
-    "num_classes": NUM_CLASSES,
-}
+args = TrainingArguments(
+        output_dir="./results",
+        run_name="ViT-L-UCB-Pruning-run1",
+        learning_rate=0.01,
+        train_batch_size=8,
+        eval_batch_size=8,
+        max_steps=20000,
+        warmup_steps=500,
+        eval_steps=250,
+        save_steps=500,
+        logging_steps=25,
+        fp16=False,
+        report_to="wandb", # Change to "none" if you don't use Weights & Biases
+    )
 
-args = TrainingArguments(**training_params)
-
-trainer = Trainer(
-    args=args,
-    model=model,
-    train_dataloader=train_loader,
-    eval_dataloader=val_loader,
-    loss_function=loss_function,
-    optimizer=optimizer, 
-    scheduler=scheduler 
-)
+trainer = CustomTrainer(
+        model=model,
+        args=args,
+        train_dataloader=train_loader,
+        eval_dataloader=val_loader,
+    )
 
 # %%
 trainer.train()
-
-# %%
-model
 
 
