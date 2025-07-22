@@ -5,12 +5,7 @@ import pandas as pd
 import numpy as np
 import torch
 
-import h5py
-import numpy as np
-import os
-import pandas as pd
-import torch
-from torch.utils.data import Dataset, Subset 
+from torch.utils.data import Subset
 from huggingface_hub import snapshot_download
 from sklearn.model_selection import train_test_split
 
@@ -27,133 +22,139 @@ class PatchFromH5Dataset(Dataset):
         metadata['oncotree_code'] = metadata['oncotree_code'].fillna('Healthy')
         metadata['oncotree_code'] = metadata['oncotree_code'].astype(str)
 
-        # # Il numero di classi è 6, come previsto.
-        # self.labels = ['SKCM', 'PRAD', 'COAD', 'SOC', 'CESC', 'BRCA']
-        # # Filtra i metadati solo per le tue 6 classi
-        # metadata = metadata[metadata['oncotree_code'].isin(self.labels)] 
+        self.labels_str = metadata['oncotree_code'].unique().tolist() # Nomi stringa delle classi
+        self.sample_to_label_str = dict(zip(metadata['id'], metadata['oncotree_code']))
+        self.label_str_to_idx = {label: i for i, label in enumerate(self.labels_str)}
 
-        # self.sample_to_label = dict(zip(metadata['id'], metadata['oncotree_code']))
-        # self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
-
-        # self.labels = ['Healthy', 'Cancer']
-        # # Filtra i metadati solo per le classi di interesse
-        # metadata = metadata[metadata['disease_state'].isin(self.labels)]
-
-        self.labels = metadata['oncotree_code'].unique().tolist()
-
-        self.sample_to_label = dict(zip(metadata['id'], metadata['oncotree_code']))
-        self.label_to_idx = {label: i for i, label in enumerate(self.labels)}
-
-        self.class_names = [None] * len(self.label_to_idx)
-        for label, idx in self.label_to_idx.items():
+        self.class_names = [None] * len(self.label_str_to_idx)
+        for label, idx in self.label_str_to_idx.items():
             self.class_names[idx] = label
 
-        # Debug: stampa le label effettive
-        print("Unique labels in metadata:", set(metadata['oncotree_code']))
-        print("Labels used:", self.labels)
-        print("Sample to label mapping example:", list(self.sample_to_label.items())[:10])
 
-        self.data_index = [] 
+
+        self.data_index = []
+        # Aggiungeremo una lista per le label numeriche corrispondenti a data_index
+        self.labels = [] # Questo sarà il nostro array NumPy delle label pre-calcolate
 
         for file in os.listdir(h5_dir):
             if file.endswith(".h5"):
                 sample_id = file.replace('.h5', '')
-                if sample_id in self.sample_to_label:
+                if sample_id in self.sample_to_label_str:
                     h5_path = os.path.join(h5_dir, file)
                     with h5py.File(h5_path, 'r') as f:
                         n_patches = len(f['img'])
+                        label_for_file = self.label_str_to_idx[self.sample_to_label_str[sample_id]]
                         for i in range(n_patches):
                             self.data_index.append((file, i))
+                            self.labels.append(label_for_file) # Salva la label numerica per ogni patch
                 else:
                     print(f"Skipping {file}: label not in selected classes.")
+
+        # Converti la lista di label in un array NumPy alla fine
+        self.labels = np.array(self.labels, dtype=np.long) # Usa np.long per coerenza con torch.long
+       
+
     def __len__(self):
         return len(self.data_index)
 
     def __getitem__(self, idx):
         file_name, patch_idx = self.data_index[idx]
-        sample_id = file_name.replace('.h5', '')
-        label_str = self.sample_to_label[sample_id]
-        label_idx = self.label_to_idx[label_str] # Ottieni l'indice intero della classe
-
+        
+        # Recupera la patch
         h5_path = os.path.join(self.h5_dir, file_name)
         with h5py.File(h5_path, 'r') as f:
-            patch = f['img'][patch_idx] 
+            patch = f['img'][patch_idx]
 
         patch = patch.astype(np.float32)
         patch = torch.tensor(patch)
 
-        # Debug: stampa la shape del patch
         if patch.ndim == 2:
             patch = patch.unsqueeze(0)
         elif patch.shape[-1] == 3:
             patch = patch.permute(2, 0, 1)
-        else:
-            print(f"Unexpected patch shape: {patch.shape}")
+        # else: Aggiungi un controllo più robusto qui se ci sono altre forme inattese
+        #    print(f"Unexpected patch shape: {patch.shape}") # Debugging
 
         if self.transform:
             patch = self.transform(patch)
 
-        # Restituisci l'indice di classe come un tensore di tipo long (necessario per CrossEntropyLoss)
+        # Recupera la label direttamente dall'array pre-calcolato
+        label_idx = self.labels[idx]
         return patch, torch.tensor(label_idx, dtype=torch.long)
     
+# --- Funzioni ausiliarie modificate per usare il nuovo attributo labels ---
+
+def stratified_split(input_dataset, test_size=0.1, val_size=0.1, random_state=42):
+    """
+    Splits the input_dataset (which can be a full Dataset or a Subset)
+    into train, val, and test subsets in a stratified manner.
+    It accesses the original dataset's labels attribute for stratification.
+    """
+    # Determine the underlying full dataset and the effective indices
+    if isinstance(input_dataset, Subset):
+        original_dataset = input_dataset.dataset # Access the original dataset from the Subset
+        effective_indices = input_dataset.indices # Get the indices of the Subset
+    else: # It's already the full dataset
+        original_dataset = input_dataset
+        effective_indices = list(range(len(input_dataset)))
+
+    # Get the labels corresponding to the effective_indices from the original_dataset
+    # This is efficient because original_dataset.labels is pre-computed
+    labels_for_splitting = [original_dataset.labels[i] for i in effective_indices]
+
+    # Perform the first split: train+val vs test
+    trainval_local_idx, test_local_idx = train_test_split(
+        list(range(len(effective_indices))), # Split local indices of the input_dataset
+        test_size=test_size,
+        stratify=labels_for_splitting,
+        random_state=random_state
+    )
+
+    # Get labels for the second split using the local indices
+    trainval_local_labels = [labels_for_splitting[i] for i in trainval_local_idx]
+
+    # Perform the second split: train vs val
+    train_local_idx, val_local_idx = train_test_split(
+        trainval_local_idx,
+        test_size=val_size / (1 - test_size),
+        stratify=trainval_local_labels,
+        random_state=random_state
+    )
+
+    # Convert local indices back to original dataset indices
+    train_global_idx = [effective_indices[i] for i in train_local_idx]
+    val_global_idx = [effective_indices[i] for i in val_local_idx]
+    test_global_idx = [effective_indices[i] for i in test_local_idx]
+
+    return train_global_idx, val_global_idx, test_global_idx
+
+def get_labels_from_indices(indices, full_dataset):
+    """
+    Recupera le label dai subset di indici usando l'attributo .labels del dataset.
+    """
+    return [full_dataset.labels[i] for i in indices]
+
+
 
 def download_dataset(repo_id = "MahmoodLab/hest", dest_folder = "/equilibrium/datasets/TCGA-histological-data/hest/patches", subfolder = "patches"):
-
     snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
         local_dir=dest_folder,
         allow_patterns=[f"{subfolder}/*"],
-        local_dir_use_symlinks=False  # imposta True se vuoi risparmiare spazio
+        local_dir_use_symlinks=False
     )
-
-
-
-def stratified_split(dataset, test_size=0.1, val_size=0.1, random_state=42):
-    """
-    Suddivide il dataset in train, val e test in modo stratificato.
-    """
-    labels = [dataset.label_to_idx[dataset.sample_to_label[file.replace('.h5', '')]]
-              for (file, _) in dataset.data_index]
-    indices = list(range(len(dataset)))
-
-    # Primo split: train+val vs test
-    trainval_idx, test_idx = train_test_split(
-        indices,
-        test_size=test_size,
-        stratify=labels,
-        random_state=random_state
-    )
-
-    # Labels per il secondo split
-    trainval_labels = [labels[i] for i in trainval_idx]
-
-    # Secondo split: train vs val
-    train_idx, val_idx = train_test_split(
-        trainval_idx,
-        test_size=val_size / (1 - test_size),
-        stratify=trainval_labels,
-        random_state=random_state
-    )
-
-    return train_idx, val_idx, test_idx
-
-def get_labels_from_indices(indices, full_dataset):
-    return [
-        full_dataset.label_to_idx[full_dataset.sample_to_label[full_dataset.data_index[i][0].replace('.h5', '')]]
-        for i in indices
-    ]
 
 def plot_class_distributions(train_dataset, val_dataset, test_dataset, full_dataset, class_names=None):
     """
-    Plotta la distribuzione delle classi nei set di train, val e test.
+    Plot the class distributions in train, val, and test sets.
     """
-    # Estrai i label
-    train_labels = get_labels_from_indices(train_dataset, full_dataset)
-    val_labels = get_labels_from_indices(val_dataset, full_dataset)
-    test_labels = get_labels_from_indices(test_dataset, full_dataset)
+    # Extract labels
+    train_labels = get_labels_from_indices(train_dataset.indices, full_dataset) # Access .indices of Subset
+    val_labels = get_labels_from_indices(val_dataset.indices, full_dataset)     # Access .indices of Subset
+    test_labels = get_labels_from_indices(test_dataset.indices, full_dataset)   # Access .indices of Subset
 
-    # Conta le occorrenze
+    # Count occurrences
     def count_labels(labels):
         return dict(Counter(labels))
 
@@ -161,20 +162,25 @@ def plot_class_distributions(train_dataset, val_dataset, test_dataset, full_data
     val_counts = count_labels(val_labels)
     test_counts = count_labels(test_labels)
 
-    # Classi ordinate
-    all_classes = sorted(set(train_counts) | set(val_counts) | set(test_counts))
+    # Ordered classes
+    all_classes_indices = sorted(set(train_counts) | set(val_counts) | set(test_counts))
+    
+    # Use class_names from the full_dataset if not provided
     if class_names is None:
-        class_names = {i: str(i) for i in all_classes}
+        class_names_map = full_dataset.class_names # Get the list of string names
+        # Map indices to names
+        class_names_dict = {i: class_names_map[i] for i in all_classes_indices}
+    else:
+        class_names_dict = {i: str(i) for i in all_classes_indices} # Fallback if class_names is provided but not mapping
 
-    # Crea DataFrame per il plot
-    import pandas as pd
+    # Create DataFrame for plotting
     data = []
     for split_name, counts in zip(['Train', 'Validation', 'Test'], [train_counts, val_counts, test_counts]):
-        for cls in all_classes:
+        for cls_idx in all_classes_indices:
             data.append({
                 'Split': split_name,
-                'Class': class_names.get(cls, str(cls)),
-                'Count': counts.get(cls, 0)
+                'Class': class_names_dict.get(cls_idx, str(cls_idx)), # Use mapped class name
+                'Count': counts.get(cls_idx, 0)
             })
     df = pd.DataFrame(data)
 
@@ -184,5 +190,3 @@ def plot_class_distributions(train_dataset, val_dataset, test_dataset, full_data
     plt.title("Distribuzione delle classi nei set di Train/Val/Test")
     plt.tight_layout()
     plt.show()
-
-
