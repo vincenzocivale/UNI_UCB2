@@ -3,15 +3,7 @@ output_notebook/
 output/
 nohup.out
 *.log
-# Model weights
-*.bin
 
-# Weights & Biases logs
-wandb/
-*.wandb
-
-# Checkpoints
-results/
 results/
 wandb/
 *.bin
