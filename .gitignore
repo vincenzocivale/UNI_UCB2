@@ -12,3 +12,7 @@ wandb/
 
 # Checkpoints
 results/
+results/
+wandb/
+*.bin
+*.wandb
