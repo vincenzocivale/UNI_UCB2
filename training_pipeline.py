@@ -8,124 +8,84 @@ from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_wi
 
 # from src.utils.hf_utils import download_weights
 # from src.utils.vit_config import inizialize_model
-from src.data.dataset import PatchFromH5Dataset
-from src.rl.train import CustomTrainer, TrainingArguments
+from src.data.dataset import PatchFromH5Dataset, stratified_split, plot_class_distributions
+from src.rl.train import ModelTrainer, TrainingArguments
 
 from src.rl.modelling import ViT_UCB_Pruning
 
 
 # %%
-NUM_STEPS = 100000 
-LEARNING_RATE = 0.1 
-WEIGHT_DECAY = 0.01 
-DECAY_TYPE = "cosine"
-WARMUP_STEPS = 500
 IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 8
-VAL_BATCH_SIZE = 8
-NUM_CLASSES = 2
-GRADIENT_ACCUMULATION_STEPS = 4
-
-# %%
-# HF_WEIGHTS_PATH = "/equilibrium/datasets/TCGA-histological-data/vit_weights_cache"
-# weights_path = download_weights(HF_WEIGHTS_PATH)
-
-# timm_pretrained_state_dict = torch.load(weights_path, map_location="cpu")
-
-# %%
-model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=2)
+NUM_EPOCHS = 70
 
 # %%
 dataset = PatchFromH5Dataset(
-    h5_dir='/equilibrium/datasets/TCGA-histological-data/hest_patches_only/patches',
+    h5_dir='/equilibrium/datasets/TCGA-histological-data/hest/patches/patches/',
     transform=transforms.Compose([
         transforms.Resize(IMG_SIZE),
         transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),])
 )
 
 # %%
-labels = [dataset.label_to_idx[dataset.sample_to_label[file.replace('.h5','')]]
-          for (file, _) in dataset.data_index]
+train_idx, val_idx, test_idx = stratified_split(dataset, test_size=0.3, val_size=0.3, random_state=42)
 
-indices = list(range(len(dataset)))
+# %%
+plot_class_distributions(train_idx, val_idx, test_idx, full_dataset=dataset)
 
-# Split stratificato
-train_idx, val_idx = train_test_split(
-    indices,
-    test_size=0.2,
-    random_state=42,
-    stratify=labels
-)
-
-# Crea i Subset
+# %%
 train_dataset = Subset(dataset, train_idx)
 val_dataset = Subset(dataset, val_idx)
+test_dataset = Subset(dataset, test_idx)
 
+# %%
 train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=16, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16, drop_last=True)
 
 # %%
-# Plot distribution of classes in train and val sets
-import matplotlib.pyplot as plt
-import numpy as np
+labels_num = len(dataset.labels)
 
-def plot_class_distribution(labels, title):
-    unique, counts = np.unique(labels, return_counts=True)
-    plt.bar(unique, counts)
-    plt.xlabel('Class')
-    plt.ylabel('Count')
-    plt.title(title)
-    plt.xticks(unique)
-    plt.show()
-plot_class_distribution([labels[i] for i in train_idx], "Train Set Class Distribution")
-plot_class_distribution([labels[i] for i in val_idx], "Validation Set Class Distribution")
-
-# %%
-loss_function = torch.nn.CrossEntropyLoss()
-
-# %%
-optimizer = torch.optim.SGD(
-    model.parameters(),
-    lr=LEARNING_RATE,
-    momentum=0.9,
-    weight_decay=WEIGHT_DECAY,
-)
-
-# %%
-if DECAY_TYPE == "cosine":
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=WARMUP_STEPS,
-        num_training_steps=NUM_STEPS
-    )
-else: # DECAY_TYPE == "linear"
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=WARMUP_STEPS,
-        num_training_steps=NUM_STEPS
-    )
+print(f"Number of classes: {labels_num}")
+model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=labels_num)
 
 # %%
 args = TrainingArguments(
         output_dir="./results",
         run_name="ViT-L-UCB-Pruning-run1",
-        learning_rate=0.01,
+        num_train_epochs=NUM_EPOCHS,
+        learning_rate=0.1,
         train_batch_size=8,
         eval_batch_size=8,
         max_steps=20000,
         warmup_steps=500,
-        eval_steps=250,
-        save_steps=500,
-        logging_steps=25,
+        eval_steps=92406,
+        save_steps=92406,
+        logging_steps=2500,
         fp16=False,
-        report_to="wandb", # Change to "none" if you don't use Weights & Biases
+        report_to="wandb", 
+        early_stopping_patience=3, # Interrompi dopo 3 valutazioni senza miglioramento
+        early_stopping_metric="eval/loss", # Oppure monitora la loss (un valore più basso è meglio)
     )
 
-trainer = CustomTrainer(
+
+
+# %%
+optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+# The scheduler needs max_steps, so we calculate it first
+num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
+
+# %%
+
+trainer = ModelTrainer(
         model=model,
         args=args,
         train_dataloader=train_loader,
         eval_dataloader=val_loader,
+        test_dataloader=test_loader,
+        class_names=dataset.class_names,           # Pass the class names
+        optimizers=(optimizer, scheduler) 
     )
 
 # %%
