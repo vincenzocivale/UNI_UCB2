@@ -8,3 +8,5 @@ results/
 wandb/
 *.bin
 *.wandb
+.venv/
+*_pycache__/
