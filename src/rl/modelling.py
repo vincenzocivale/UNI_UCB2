@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import timm
 import math
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Optional
 
 # Suppress timm warnings about dynamic image size
 import warnings
@@ -165,16 +165,12 @@ class ViT_UCB_Pruning(nn.Module):
         # 1. Load the pre-trained model to source weights and config
         print(f"Loading source model '{model_name}'...")
 
-        # -- THE FIX IS HERE --
-        # Add init_values to enable LayerScale, matching the pretrained model's architecture.
-        # The value 1e-5 is a common default for LayerScale initialization.
         source_model = timm.create_model(
             model_name, 
             pretrained=pretrained,
-            init_values=1e-5  # <--- ADD THIS ARGUMENT
+            init_values=1e-5  
         )
         
-        # 2. Copy essential non-block layers
         self.patch_embed = source_model.patch_embed
         self.cls_token = source_model.cls_token
         self.pos_embed = source_model.pos_embed
@@ -188,10 +184,10 @@ class ViT_UCB_Pruning(nn.Module):
 
         self.n_classes = n_classes if n_classes is not None else source_model.head.in_features
         
-        # 3. Create custom UCB blocks and load weights
+        
         self.blocks = nn.ModuleList([UCBBlock(block) for block in source_model.blocks])
         
-        # 4. Initialize UCB count score buffers
+       
         num_layers = len(self.blocks)
         num_heads = self.blocks[0].attn.num_heads
         num_patches = self.pos_embed.shape[1] 
@@ -201,8 +197,6 @@ class ViT_UCB_Pruning(nn.Module):
             torch.zeros(num_layers, num_heads, num_patches, num_patches)
         )
         
-        print("✅ ViT with UCB Pruning successfully initialized.")
-        print(f"   - Layers: {num_layers}, Heads: {num_heads}, Patches: {num_patches}")
         
     def forward(self, x: torch.Tensor, counter: int, ucb_enabled: bool = True, labels: torch.Tensor = None):
         # (The existing forward logic remains the same)
@@ -224,7 +218,6 @@ class ViT_UCB_Pruning(nn.Module):
         x = self.norm(x)
         logits = self.head(x[:, 0])
         
-        # NEW: Calculate loss if labels are provided
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
@@ -234,3 +227,81 @@ class ViT_UCB_Pruning(nn.Module):
 
         return logits
 
+
+
+class StandardViT(nn.Module):
+    """
+    Standard Vision Transformer classifier.
+
+    This model loads a pretrained Vision Transformer from timm, replaces the
+    head with a new classifier, and uses the standard attention mechanism
+    without UCB pruning for direct performance comparison.
+    """
+    def __init__(self, model_name: str = "hf-hub:MahmoodLab/uni", pretrained: bool = True, n_classes: int = 2):
+        """
+        Initializes the StandardViT model.
+
+        Args:
+            model_name (str): The model name to load from timm's hub.
+            pretrained (bool): Whether to load pretrained weights.
+            n_classes (int): The number of output classes for the new head.
+        """
+        super().__init__()
+        
+        # Load the specified pretrained model from timm
+        source_model = timm.create_model(
+            model_name, 
+            pretrained=pretrained,
+            init_values=1e-5  # LayerScale initialization value
+        )
+        
+        # --- Inherit core layers from the pretrained model ---
+        self.patch_embed = source_model.patch_embed
+        self.cls_token = source_model.cls_token
+        self.pos_embed = source_model.pos_embed
+        self.pos_drop = source_model.pos_drop
+        self.norm = source_model.norm
+        
+        # The transformer blocks are used directly from the source model
+        self.blocks = source_model.blocks
+        
+        # --- Create a new classification head ---
+        # Get the number of input features from the original model's head
+        num_in_features = source_model.embed_dim 
+        self.head = nn.Linear(num_in_features, n_classes)
+        self.n_classes = n_classes
+
+        print(f"Model '{model_name}' loaded. New classification head with {n_classes} classes created.")
+
+    def forward(self, x, labels=None, counter=None, ucb_enabled=False):
+        """
+        Forward pass for the standard Vision Transformer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+            labels (Optional[torch.Tensor]): Optional labels for loss calculation.
+
+        Returns:
+            If labels are provided, returns a tuple of (loss, logits).
+            Otherwise, returns only the logits tensor.
+        """
+        # 1. Get patch embeddings and add CLS token and positional embeddings
+        x = self.patch_embed(x)
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        x = self.pos_drop(x + self.pos_embed)
+        
+        # 2. Pass through the transformer blocks
+        x = self.blocks(x)
+        
+        # 3. Final normalization and classification head
+        x = self.norm(x)
+        # Use the output corresponding to the CLS token for classification
+        logits = self.head(x[:, 0])
+        
+        # 4. Calculate loss if labels are provided
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.n_classes), labels.view(-1))
+            return (loss, logits)
+
+        return logits

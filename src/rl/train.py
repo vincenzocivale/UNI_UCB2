@@ -95,7 +95,7 @@ class ModelTrainer:
             self.args.num_train_epochs = math.ceil(self.args.max_steps / num_update_steps_per_epoch)
 
         # Setup device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         
         # --- MODIFIED: Handle external vs. internal optimizer/scheduler ---
@@ -106,7 +106,7 @@ class ModelTrainer:
         # Mixed Precision & Logging
         self.scaler = GradScaler(enabled=self.args.fp16)
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
-            wandb.init(project="vit-ucb-pruning", name=self.args.run_name, config=vars(self.args))
+            wandb.init(project="vit-ucb-pruning2", name=self.args.run_name, config=vars(self.args))
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
         self.best_metric = None
@@ -131,7 +131,7 @@ class ModelTrainer:
             return 0.5 * (1.0 + torch.cos(torch.tensor(math.pi * progress)))
         return LambdaLR(self.optimizer, lr_lambda)
 
-    def train(self):
+    def train(self, ucb_logging: bool = True):
         logger.info("***** Running training *****")
         logger.info(f"  Num Epochs = {self.args.num_train_epochs}")
         logger.info(f"  Total optimization steps = {self.args.max_steps}")
@@ -168,7 +168,7 @@ class ModelTrainer:
                         }
 
                       
-                        if global_step > 500: # Only log UCB stats after pruning starts
+                        if global_step > 500 and ucb_logging==True: # Only log UCB stats after pruning starts
                             with torch.no_grad():
                                 # Access the UCB buffer from the model
                                 ucb_scores = self.model.ucb_count_scores.detach()
