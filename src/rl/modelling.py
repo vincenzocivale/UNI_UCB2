@@ -5,6 +5,7 @@ import timm
 import math
 import numpy as np
 from typing import Tuple, Optional
+import wandb
 
 # Suppress timm warnings about dynamic image size
 import warnings
@@ -66,9 +67,7 @@ class UCBAttention(nn.Module):
             ucb_exploration = ucb_exploration[:, :, 1:]  
 
         ucb_scores = scores_for_topk + ucb_exploration.unsqueeze(0)  # broadcast su batch
-
         ucb_exploration = ucb_exploration[:, : scores_for_topk.shape[-1]]
-
         ucb_scores = scores_for_topk + ucb_exploration.unsqueeze(0).unsqueeze(0)
 
         # Top-k
