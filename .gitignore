@@ -10,3 +10,4 @@ wandb/
 *.wandb
 .venv/
 *_pycache__/
+*.out
