@@ -199,6 +199,10 @@ class ModelTrainer:
                 )
             }, step=global_step)
 
+        if self.test_dataloader is not None:
+            logger.info("Final evaluation (test set):")
+            self.predict()
+
         self._save_checkpoint(global_step, final=True)
 
     def _training_step(self, batch: tuple, counter: int):
@@ -303,8 +307,19 @@ class ModelTrainer:
         output_path = os.path.join(self.args.output_dir, name)
         os.makedirs(output_path, exist_ok=True)
 
+        ckpt_path = os.path.join(output_path, "pytorch_model.bin")
         logger.info(f"Saving model checkpoint to {output_path}")
-        torch.save(self.model.state_dict(), os.path.join(output_path, "pytorch_model.bin"))
+        torch.save(self.model.state_dict(), ckpt_path)
+
+        # Se W&B è abilitato, salva anche l'artifact
+        if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
+            artifact = wandb.Artifact(
+                name=f"{self.args.run_name}-{name}",
+                type="model"
+            )
+            artifact.add_file(ckpt_path)
+            wandb.log_artifact(artifact)
+            logger.info(f"Uploaded checkpoint {name} to W&B.")
 
     def _check_early_stopping(self, metrics: Dict[str, float]) -> bool:
         metric_value = metrics.get(self.args.early_stopping_metric)

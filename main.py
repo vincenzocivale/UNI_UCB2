@@ -19,9 +19,9 @@ IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 8
 NUM_EPOCHS = 50
 
-PRUNING_RATIO = 0.001
+PRUNING_RATIO = 0.01
 
-DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
+DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
 # %%
 dataset = PatchFromH5Dataset(
@@ -114,7 +114,7 @@ args = TrainingArguments(
         logging_steps=300,
         fp16=False,
         report_to="wandb", 
-        early_stopping_patience=3, # Interrompi dopo 3 valutazioni senza miglioramento
+        early_stopping_patience=7, 
         early_stopping_metric="eval/loss", # Oppure monitora la loss (un valore più basso è meglio)
     )
 
