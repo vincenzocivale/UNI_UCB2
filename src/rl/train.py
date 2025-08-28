@@ -292,8 +292,7 @@ class ModelTrainer:
             "test/f1": f1,
         }
 
-        # Evita conflitti di step
-        self._log(metrics_to_log, step=self.args.max_steps + 1)
+        # self._log(metrics_to_log) # RIMUOVI QUESTA RIGA
 
         # Confusion matrix va loggata direttamente
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
@@ -303,9 +302,10 @@ class ModelTrainer:
                     y_true=all_labels,
                     class_names=self.class_names
                 )
-            }, step=self.args.max_steps + 1)
+            }) 
 
         # Log su W&B
+        # QUESTA CHIAMATA È CORRETTA E SUFFICIENTE
         self._log(metrics_to_log, step=self.args.max_steps)
 
         self.model.train()
@@ -330,7 +330,7 @@ class ModelTrainer:
         output_path = os.path.join(self.args.output_dir, name)
         os.makedirs(output_path, exist_ok=True)
 
-        ckpt_path = os.path.join(output_path, "pytorch_model.bin")
+        ckpt_path = os.path.join(output_path, f"{self.args.run_name}.bin")
         logger.info(f"Saving model checkpoint to {output_path}")
         torch.save(self.model.state_dict(), ckpt_path)
 
