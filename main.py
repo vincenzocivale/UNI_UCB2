@@ -21,7 +21,7 @@ NUM_EPOCHS = 50
 
 PRUNING_RATIO = 0.01
 
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 
 # %%
 dataset = PatchFromH5Dataset(

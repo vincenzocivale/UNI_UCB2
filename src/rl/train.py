@@ -91,7 +91,7 @@ class ModelTrainer:
 
         self.scaler = GradScaler(enabled=self.args.fp16)
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
-            wandb.init(project="vit-ucb-pruning2", name=self.args.run_name, config=vars(self.args))
+            wandb.init(project="vit-ucb-pruning3", name=self.args.run_name, config=vars(self.args))
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
         self.best_metric = None
@@ -256,6 +256,10 @@ class ModelTrainer:
         return metrics
 
     def predict(self):
+        if self.test_dataloader is None:
+            logger.warning("Test dataloader is not provided. Skipping test evaluation.")
+            return
+
         logger.info("***** Running Prediction on Test Set *****")
         self.model.eval()
 
@@ -266,10 +270,10 @@ class ModelTrainer:
         for batch in progress_bar:
             inputs, labels = batch
             inputs = inputs.to(self.device)
+            labels = labels.to(self.device)
 
             with torch.no_grad(), autocast(enabled=self.args.fp16):
                 logits = self.model(x=inputs, counter=99999, ucb_enabled=True)
-
             preds = torch.argmax(logits, dim=-1)
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
@@ -277,16 +281,35 @@ class ModelTrainer:
         all_preds = torch.cat(all_preds).numpy()
         all_labels = torch.cat(all_labels).numpy()
 
-        logger.info("Logging confusion matrix to Weights & Biases.")
-        self._log({
-            "test/confusion_matrix": wandb.plot.confusion_matrix(
-                preds=all_preds,
-                y_true=all_labels,
-                class_names=self.class_names
-            )
-        }, step=self.args.max_steps)
+        # Calcola metriche
+        total_correct = (all_preds == all_labels).sum()
+        total_samples = all_labels.shape[0]
+        accuracy = total_correct / total_samples
+        f1 = f1_score(all_labels, all_preds, average="macro")
+
+        metrics_to_log = {
+            "test/accuracy": accuracy,
+            "test/f1": f1,
+        }
+
+        # Evita conflitti di step
+        self._log(metrics_to_log, step=self.args.max_steps + 1)
+
+        # Confusion matrix va loggata direttamente
+        if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
+            wandb.log({
+                "test/confusion_matrix": wandb.plot.confusion_matrix(
+                    preds=all_preds,
+                    y_true=all_labels,
+                    class_names=self.class_names
+                )
+            }, step=self.args.max_steps + 1)
+
+        # Log su W&B
+        self._log(metrics_to_log, step=self.args.max_steps)
 
         self.model.train()
+
 
     def _log(self, metrics: Dict[str, float], step: int):
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
