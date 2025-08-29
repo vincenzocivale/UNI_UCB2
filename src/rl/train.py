@@ -197,7 +197,7 @@ class ModelTrainer:
                     y_true=val_labels,
                     class_names=self.class_names
                 )
-            }, step=global_step)
+            })
 
         if self.test_dataloader is not None:
             logger.info("Final evaluation (test set):")
