@@ -19,7 +19,7 @@ IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 8
 NUM_EPOCHS = 50
 
-PRUNING_RATIO = 0.01
+PRUNING_RATIO = 0.02
 
 DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -115,7 +115,7 @@ args = TrainingArguments(
         fp16=False,
         report_to="wandb", 
         early_stopping_patience=7, 
-        early_stopping_metric="eval/loss", # Oppure monitora la loss (un valore più basso è meglio)
+        early_stopping_metric="eval/loss", 
     )
 
 
