@@ -306,12 +306,12 @@ class ModelTrainer:
 
         # Log su W&B
         # QUESTA CHIAMATA È CORRETTA E SUFFICIENTE
-        self._log(metrics_to_log, step=self.args.max_steps)
+        self._log(metrics_to_log)
 
         self.model.train()
 
 
-    def _log(self, metrics: Dict[str, float], step: int):
+    def _log(self, metrics: Dict[str, float]):
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
             wandb_metrics = {}
             for key, value in metrics.items():
@@ -322,7 +322,7 @@ class ModelTrainer:
                     wandb_metrics[key + "/std"] = value.float().std().item()
                 else:
                     wandb_metrics[key] = value
-            wandb.log(wandb_metrics, step=step)
+            wandb.log(wandb_metrics)
 
 
     def _save_checkpoint(self, step: int, final: bool = False):
