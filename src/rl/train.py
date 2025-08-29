@@ -163,12 +163,12 @@ class ModelTrainer:
                                     "ucb/selection_distribution": ucb_scores
                                 })
 
-                        self._log(metrics_to_log, step=global_step)
+                        self._log(metrics_to_log)
                         train_loss = 0.0
 
                     if self.args.evaluation_strategy == "steps" and global_step % self.args.eval_steps == 0:
                         metrics = self.evaluate(counter=global_step)
-                        self._log(metrics, step=global_step)
+                        self._log(metrics)
 
                 if global_step >= self.args.max_steps:
                     break
@@ -176,7 +176,7 @@ class ModelTrainer:
             if self.args.early_stopping_patience > 0:
                 logger.info(f"--- Running End-of-Epoch Evaluation for Epoch {epoch + 1} ---")
                 metrics = self.evaluate(counter=global_step)
-                self._log(metrics, step=global_step)
+                self._log(metrics)
 
                 if self._check_early_stopping(metrics):
                     logger.info(f"Early stopping condition met after epoch {epoch + 1}. Terminating training.")
@@ -187,7 +187,7 @@ class ModelTrainer:
 
         logger.info("Training finished. Final evaluation (validation set):")
         metrics, val_preds, val_labels = self.evaluate(counter=global_step, return_preds=True)
-        self._log(metrics, step=global_step)
+        self._log(metrics)
 
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
             logger.info("Logging confusion matrix for validation set to W&B.")
