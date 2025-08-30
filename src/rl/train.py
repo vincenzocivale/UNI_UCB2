@@ -181,8 +181,14 @@ class ModelTrainer:
                     if self.args.save_strategy == "steps" and global_step % self.args.save_steps == 0:
                         self._save_checkpoint(global_step)
 
-                if global_step >= self.args.max_steps:
-                    break
+            if self.args.evaluation_strategy == "epoch":
+                metrics = self.evaluate(counter=global_step)
+    
+                self._log(metrics, step=global_step)
+                if self._check_early_stopping():
+                    logger.info("Early stopping attivato. Interruzione del training.")
+                    self.finalize_training(global_step)
+                    return
             
             if global_step >= self.args.max_steps:
                 break
