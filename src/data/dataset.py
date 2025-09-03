@@ -78,12 +78,9 @@ class PatchFromH5Dataset(Dataset):
         if self.transform:
             patch = self.transform(patch)
 
+        # Recupera la label direttamente dall'array pre-calcolato
         label_idx = self.labels[idx]
-        
-        return {
-            'pixel_values': patch, 
-            'labels': torch.tensor(label_idx, dtype=torch.long)
-        }
+        return patch, torch.tensor(label_idx, dtype=torch.long)
     
 # --- Funzioni ausiliarie modificate per usare il nuovo attributo labels ---
 

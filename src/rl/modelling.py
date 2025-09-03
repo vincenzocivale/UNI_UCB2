@@ -173,9 +173,8 @@ class ViT_UCB_Pruning(nn.Module):
 
         self.register_buffer("ucb_count_scores", torch.zeros(num_layers, num_heads, num_patches, num_patches))
 
-    def forward(self, pixel_values: torch.Tensor, counter: int, ucb_enabled: bool = True, labels: torch.Tensor = None):
-        # Il nome 'x' diventa 'pixel_values'
-        x = self.patch_embed(pixel_values)
+    def forward(self, x: torch.Tensor, counter: int, ucb_enabled: bool = True, labels: torch.Tensor = None):
+        x = self.patch_embed(x)
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
