@@ -1,25 +1,12 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import timm
-import math
 import numpy as np
-from typing import Tuple, Optional
-import wandb
-
-# Suppress timm warnings about dynamic image size
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, message=".*Using 'dynamic_img_size' with a static model is not recommended.*")
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import timm
 
 class UCBAttention(nn.Module):
     """
-    Custom Attention module with UCB-based patch pruning (aggiornata).
-    Compatibile con timm.
+    Custom Attention module with UCB-based patch pruning.
+    Corrected version.
     """
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
                  k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
@@ -38,62 +25,65 @@ class UCBAttention(nn.Module):
         self.beta = beta
         self.exclude_cls = exclude_cls
 
-    def ucb_score_pruning(self, attn_scores, attn_probs, v, iteration, count_score_buffer):
+    def ucb_score_pruning(self, attn_scores, v, iteration, count_score_buffer):
         """
-        Applica il pruning UCB sulle attention probabilities.
+        Applies UCB pruning to the attention scores.
         """
-        B, H, N, _ = attn_scores.shape
+        B, H, N_q, N_k = attn_scores.shape
 
-        # Determina k dinamico
+        # Determine dynamic k
+        num_keys_to_consider = N_k - 1 if self.exclude_cls else N_k
         if self.keep_ratio is not None:
-            k = max(1, int((N - 1 if self.exclude_cls else N) * self.keep_ratio))
+            k = max(1, int(num_keys_to_consider * self.keep_ratio))
         elif self.k is not None:
-            k = min(self.k, N - (1 if self.exclude_cls else 0))
+            k = min(self.k, num_keys_to_consider)
         else:
-            k = N
+            k = num_keys_to_consider
+        
+        # Handle the case where k is 0 or less
+        if k <= 0:
+            # Return unpruned attention if there's nothing to keep
+            return attn_scores.softmax(dim=-1), None
 
-        # Escludi CLS se richiesto
+        # Exclude CLS token scores if required
         if self.exclude_cls:
             scores_for_topk = attn_scores[:, :, :, 1:]
+            count_buffer_keys = count_score_buffer[:, 1:]
         else:
             scores_for_topk = attn_scores
+            count_buffer_keys = count_score_buffer
 
-        # Calcolo UCB
+        # UCB exploration term is calculated per-key
         ucb_exploration = self.beta * torch.sqrt(
-        torch.log(torch.tensor(iteration + 1.0, device=v.device)) / (count_score_buffer + 1e-6)
-        )  # shape (H, N, N)
+            torch.log(torch.tensor(iteration + 1.0, device=v.device)) / (count_buffer_keys + 1e-6)
+        )
 
-        if self.exclude_cls:
-            ucb_exploration = ucb_exploration[:, :, 1:]  
+        # Correctly broadcast the exploration bonus
+        ucb_scores = scores_for_topk + ucb_exploration.unsqueeze(0).unsqueeze(2)
 
-        ucb_scores = scores_for_topk + ucb_exploration.unsqueeze(0)  # broadcast su batch
-        ucb_exploration = ucb_exploration[:, : scores_for_topk.shape[-1]]
-        ucb_scores = scores_for_topk + ucb_exploration.unsqueeze(0).unsqueeze(0)
-
-        # Top-k
+        # Top-k selection
         _, top_indices = torch.topk(ucb_scores, k=k, dim=-1, sorted=False)
 
-        mask = torch.zeros_like(scores_for_topk, dtype=attn_scores.dtype)
-        B, H, Q, _ = scores_for_topk.shape
-        batch_indices = torch.arange(B, device=v.device).view(B, 1, 1, 1).expand(-1, H, Q, k)
-        head_indices = torch.arange(H, device=v.device).view(1, H, 1, 1).expand(B, -1, Q, k)
-        query_indices = torch.arange(Q, device=v.device).view(1, 1, Q, 1).expand(B, H, -1, k)
+        # Create a mask from the top-k indices
+        mask = torch.zeros_like(scores_for_topk, dtype=torch.bool)
+        mask.scatter_(-1, top_indices, True)
 
-        mask[batch_indices, head_indices, query_indices, top_indices] = 1.0
-
+        # Re-attach the CLS token if it was excluded, ensuring it's never pruned
         if self.exclude_cls:
-            mask_full = torch.cat([torch.ones_like(mask[:, :, :, :1]), mask], dim=-1)
+            cls_mask = torch.ones(B, H, N_q, 1, dtype=torch.bool, device=mask.device)
+            mask_full = torch.cat([cls_mask, mask], dim=-1)
         else:
             mask_full = mask
+            
+        # Apply mask and renormalize
+        pruned_attn_scores = torch.full_like(attn_scores, -torch.finfo(attn_scores.dtype).max)
+        pruned_attn_scores[mask_full] = attn_scores[mask_full]
+        pruned_attn_probs = pruned_attn_scores.softmax(dim=-1)
 
-        # Applica mask a attn_probs e rinormalizza
-        pruned_attn = attn_probs * mask_full
-        pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
+        # score_delta now reflects per-key counts
+        score_delta = mask_full.sum(dim=(0, 2)).detach()
 
-        context = torch.matmul(pruned_attn, v)
-        score_delta = mask_full.sum(dim=0).detach()
-
-        return context, score_delta
+        return pruned_attn_probs, score_delta
 
     def forward(self, x, counter, ucb_enabled, ucb_count_score):
         B, N, C = x.shape
@@ -101,17 +91,18 @@ class UCBAttention(nn.Module):
         q, k, v = qkv.unbind(0)
 
         attn_scores = (q @ k.transpose(-1, -2)) * self.scale
-        attn_probs = attn_scores.softmax(dim=-1)
-
+        
         score_delta = None
         if ucb_enabled and counter > 50:
-            context, score_delta = self.ucb_score_pruning(
-                attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score, 
+            attn_probs, score_delta = self.ucb_score_pruning(
+                attn_scores, v, iteration=counter, count_score_buffer=ucb_count_score,
             )
-            context = self.attn_drop(context)
         else:
-            attn_probs = self.attn_drop(attn_probs)
-            context = torch.matmul(attn_probs, v)
+            attn_probs = attn_scores.softmax(dim=-1)
+
+        # Apply dropout consistently to attention probabilities
+        attn_probs = self.attn_drop(attn_probs)
+        context = torch.matmul(attn_probs, v)
 
         x = context.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -123,11 +114,11 @@ class UCBBlock(nn.Module):
     def __init__(self, original_block: nn.Module, **ucb_kwargs):
         super().__init__()
         self.norm1 = original_block.norm1
-        self.ls1 = original_block.ls1
+        self.ls1 = getattr(original_block, 'ls1', nn.Identity())
         self.drop_path1 = original_block.drop_path1
         self.norm2 = original_block.norm2
         self.mlp = original_block.mlp
-        self.ls2 = original_block.ls2
+        self.ls2 = getattr(original_block, 'ls2', nn.Identity())
         self.drop_path2 = original_block.drop_path2
 
         orig_attn = original_block.attn
@@ -153,16 +144,23 @@ class ViT_UCB_Pruning(nn.Module):
                  k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
         super().__init__()
         print(f"Loading source model '{model_name}'...")
-        source_model = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
+        
+        source_model = timm.create_model(
+            model_name, 
+            pretrained=pretrained, 
+            init_values=1e-5
+        )
 
         self.patch_embed = source_model.patch_embed
         self.cls_token = source_model.cls_token
         self.pos_embed = source_model.pos_embed
         self.pos_drop = source_model.pos_drop
         self.norm = source_model.norm
-        self.head = nn.Linear(source_model.head.in_features if hasattr(source_model.head, 'in_features') else 1024, n_classes)
+        
+        in_features = source_model.head.in_features if hasattr(source_model.head, 'in_features') else source_model.num_features
+        self.head = nn.Linear(in_features, n_classes) if n_classes is not None else nn.Identity()
+        self.n_classes = n_classes if n_classes is not None else in_features
 
-        self.n_classes = n_classes if n_classes is not None else source_model.head.in_features
         self.blocks = nn.ModuleList([
             UCBBlock(block, k=k, keep_ratio=keep_ratio, beta=beta, exclude_cls=exclude_cls) for block in source_model.blocks
         ])
@@ -171,7 +169,7 @@ class ViT_UCB_Pruning(nn.Module):
         num_heads = self.blocks[0].attn.num_heads
         num_patches = self.pos_embed.shape[1]
 
-        self.register_buffer("ucb_count_scores", torch.zeros(num_layers, num_heads, num_patches, num_patches))
+        self.register_buffer("ucb_count_scores", torch.zeros(num_layers, num_heads, num_patches))
 
     def forward(self, x: torch.Tensor, counter: int, ucb_enabled: bool = True, labels: torch.Tensor = None):
         x = self.patch_embed(x)
@@ -181,13 +179,13 @@ class ViT_UCB_Pruning(nn.Module):
         for i, block in enumerate(self.blocks):
             x, score_delta = block(x, counter=counter, ucb_enabled=ucb_enabled, ucb_count_score=self.ucb_count_scores[i])
             if score_delta is not None:
-                self.ucb_count_scores[i].add_(score_delta.to(self.ucb_count_scores[i].device))
+                self.ucb_count_scores[i].add_(score_delta)
 
         x = self.norm(x)
         logits = self.head(x[:, 0])
 
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.reshape(-1, self.n_classes), labels.view(-1))
+            loss = loss_fct(logits.view(-1, self.n_classes), labels.view(-1))
             return (loss, logits)
         return logits

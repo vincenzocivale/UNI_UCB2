@@ -136,6 +136,8 @@ class ModelTrainer:
         train_loss = 0.0
         self.model.train()
 
+        best_model_path = None
+        
         # Ciclo di training principale
         for epoch in range(int(math.ceil(self.args.num_train_epochs))):
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{int(self.args.num_train_epochs)}", leave=False)
@@ -169,12 +171,16 @@ class ModelTrainer:
                     # Valutazione
                     if self.args.evaluation_strategy == "steps" and global_step % self.args.eval_steps == 0:
                         metrics = self.evaluate(counter=global_step)
-                        if self._check_for_improvement(metrics):
-                             self._save_checkpoint(global_step, is_best=True)
+                        # This is where the core logic for best model check and early stopping happens
+                        if self.args.save_best_model and self._check_for_improvement(metrics):
+                            self._save_checkpoint(global_step, is_best=True)
+                            best_model_path = os.path.join(self.args.output_dir, "best_model", f"{self.args.run_name}.bin") # Save the path
+                        
                         self._log(metrics, step=global_step)
+                        
                         if self._check_early_stopping():
                             logger.info("Early stopping attivato. Interruzione del training.")
-                            self.finalize_training(global_step)
+                            self.finalize_training(global_step, best_model_path=best_model_path) # Pass the path
                             return
 
                     # Salvataggio del checkpoint
@@ -195,9 +201,16 @@ class ModelTrainer:
         
         self.finalize_training(global_step)
 
-    def finalize_training(self, global_step: int):
+    def finalize_training(self, global_step: int, best_model_path: Optional[str] = None):
         """Esegue i passaggi finali dopo il completamento del training."""
         logger.info("Training terminato. Esecuzione della valutazione finale.")
+        
+        # Load the best model if it exists.
+        # This is the key step to ensure final metrics are from the best-performing model.
+        if best_model_path and os.path.exists(best_model_path):
+            logger.info(f"Caricamento del modello migliore da {best_model_path} per la valutazione finale.")
+            self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        
         metrics, val_preds, val_labels = self.evaluate(counter=global_step, return_preds=True)
         self._log(metrics, step=global_step)
 
@@ -206,6 +219,7 @@ class ModelTrainer:
             self._log_confusion_matrix("val", val_preds, val_labels, step=global_step)
 
         if self.test_dataloader is not None:
+            # This call will now use the best model loaded above.
             self.predict(step=global_step)
         
         self._save_checkpoint(global_step, final=True)
@@ -261,8 +275,10 @@ class ModelTrainer:
         
         self.model.train()
         return (metrics, all_preds, all_labels) if return_preds else metrics
-
+    
     def predict(self, step: Optional[int] = None):
+        # This function remains unchanged as the best model is already loaded in finalize_training.
+        # The logic here is already correct for logging test metrics on W&B.
         if self.test_dataloader is None:
             logger.warning("Test dataloader non fornito. Salto della predizione sul test set.")
             return
