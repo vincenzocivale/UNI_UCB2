@@ -310,8 +310,8 @@ class ModelTrainer:
         self._log(metrics, step=step)
         logger.info(f"  Risultati test set: {metrics}")
 
-        if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
-            self._log_confusion_matrix("test", all_preds, all_labels, step=step)
+        # if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
+        #     self._log_confusion_matrix("test", all_preds, all_labels, step=step)
         
         self.model.train()
     
