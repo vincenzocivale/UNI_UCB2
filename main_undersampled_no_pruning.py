@@ -19,7 +19,7 @@ IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 8
 
 
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 
 # %%
 dataset = PatchFromH5Dataset(
@@ -92,19 +92,19 @@ print(f"Number of classes: {labels_num}")
 
 NUM_EPOCHS = 30
 
-PRUNING_RATIOs = [0.02, 0.03, 0.04]
+PRUNING_RATIO = 1
 
 
-for PRUNING_RATIO in PRUNING_RATIOs:
-    model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", 
+model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", 
     pretrained=True, 
     n_classes=labels_num, 
-    keep_ratio=PRUNING_RATIO,        
-    exclude_cls=False
+    keep_ratio=None,  
+    k=None,       
+    exclude_cls=True
 )
 
     # %%
-    args = TrainingArguments(
+args = TrainingArguments(
             output_dir="./results",
             run_name=f"ViT-L-UCB-{PRUNING_RATIO}",
             num_train_epochs=NUM_EPOCHS,
@@ -125,13 +125,13 @@ for PRUNING_RATIO in PRUNING_RATIOs:
 
 
     # %%
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     # The scheduler needs max_steps, so we calculate it first
-    num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
+num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
 
     # %%
-    trainer = ModelTrainer(
+trainer = ModelTrainer(
             model=model,
             args=args,
             train_dataloader=train_loader,
@@ -143,6 +143,6 @@ for PRUNING_RATIO in PRUNING_RATIOs:
         )
 
     # %%
-    trainer.train()
+trainer.train()
 
 
