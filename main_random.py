@@ -16,7 +16,7 @@ from src.rl.random_pruning import ViT_Random_Pruning
 
 # %%
 IMG_SIZE = 224
-TRAIN_BATCH_SIZE = 16
+TRAIN_BATCH_SIZE = 8
 NUM_EPOCHS = 30
 
 
@@ -106,12 +106,12 @@ for pruning_ratio in PRUNING_RATIOS:
     # %%
     args = TrainingArguments(
             output_dir="./results",
-            run_name=f"ViT-L-UCB-{pruning_ratio}",
+            run_name=f"ViT-L-Random-{pruning_ratio}",
             num_train_epochs=NUM_EPOCHS,
             evaluation_strategy="epoch",
             learning_rate=0.1,
-            train_batch_size=8,
-            eval_batch_size=8,
+            train_batch_size=TRAIN_BATCH_SIZE,
+            eval_batch_size=TRAIN_BATCH_SIZE,
             max_steps=-1,
             warmup_steps=500,
             eval_steps=5000,
