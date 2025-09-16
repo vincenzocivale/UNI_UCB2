@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import timm
+import random
 
-class UCBAttention(nn.Module):
+class RandomAttention(nn.Module):
     """
-    Corrected UCB Attention module with proper patch pruning.
+    Random Attention module with patch pruning - selects patches randomly instead of using UCB.
     """
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
-                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
+                 k=None, keep_ratio=None, exclude_cls=True, random_seed=None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -20,13 +21,19 @@ class UCBAttention(nn.Module):
 
         self.k = k
         self.keep_ratio = keep_ratio
-        self.beta = beta
         self.exclude_cls = exclude_cls
+        self.random_seed = random_seed
+        
+        # Initialize random number generator with seed for reproducibility
+        if random_seed is not None:
+            self.rng = torch.Generator(device='cuda')
+            self.rng.manual_seed(random_seed)
+        else:
+            self.rng = None
 
-    def ucb_score_pruning(self, attn_scores, attn_probs, v, iteration, count_score_buffer):
+    def random_score_pruning(self, attn_scores, attn_probs, v):
         """
-        Applies UCB-based patch pruning on attention probabilities.
-        Fixed to avoid NaN issues while maintaining correct behavior.
+        Applies random patch pruning on attention probabilities.
         """
         B, H, N, _ = attn_scores.shape
         device = v.device
@@ -47,45 +54,42 @@ class UCBAttention(nn.Module):
             # If no pruning specified, return original attention
             return torch.matmul(self.attn_drop(attn_probs), v), None
 
-        # Calculate patch importance scores - using attention received by each patch
-        if self.exclude_cls:
-            # Average attention each patch receives (excluding CLS)
-            patch_scores = attn_probs[:, :, :, 1:].mean(dim=2)  # (B, H, N-1)
-            relevant_counts = count_score_buffer[:, 1:]  # (H, N-1)
+        # Create or move generator to correct device
+        if self.rng is not None:
+            if self.rng.device != device:
+                # Create new generator on correct device with same seed
+                self.rng = torch.Generator(device=device)
+                if self.random_seed is not None:
+                    self.rng.manual_seed(self.random_seed)
         else:
-            patch_scores = attn_probs.mean(dim=2)  # (B, H, N)
-            relevant_counts = count_score_buffer  # (H, N)
+            # Fallback: create device-specific generator
+            self.rng = torch.Generator(device=device)
+            if self.random_seed is not None:
+                self.rng.manual_seed(self.random_seed)
 
-        # UCB exploration term
-        ucb_exploration = self.beta * torch.sqrt(
-            torch.log(torch.tensor(iteration + 1.0, device=device)) / (relevant_counts + 1e-6)
-        )
-
-        # Combine scores with exploration bonus
-        ucb_scores = patch_scores + ucb_exploration.unsqueeze(0)  # (B, H, num_patches)
-
-        # Global selection (same patches for all heads in each sample)
-        global_ucb_scores = ucb_scores.mean(dim=1)  # (B, num_patches)
-        _, selected_indices = torch.topk(global_ucb_scores, k=k, dim=-1)  # (B, k)
-
-        # Create attention mask - USE YOUR ORIGINAL APPROACH (more permissive)
+        # Randomly select patches to keep
         mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
         
-        if self.exclude_cls:
-            # Always preserve CLS token interactions
-            mask[:, :, :, 0] = 1.0  # All tokens can attend to CLS
-            mask[:, :, 0, :] = 1.0  # CLS can attend to all tokens
-            
-            # Convert patch indices to token indices (add 1 for CLS offset)
-            token_indices = selected_indices + 1  # (B, k)
-            
-            for b in range(B):
-                mask[b, :, :, token_indices[b]] = 1.0  # All can attend TO selected
-                mask[b, :, token_indices[b], :] = 1.0  # Selected can attend to ALL
-        else:
-            for b in range(B):
-                mask[b, :, :, selected_indices[b]] = 1.0  # All can attend TO selected
-                mask[b, :, selected_indices[b], :] = 1.0  # Selected can attend to ALL
+        for b in range(B):
+            if self.exclude_cls:
+                # Randomly select k patches from the non-CLS tokens
+                # MODIFIED: Added device=device argument
+                patch_indices = torch.randperm(total_patches, generator=self.rng, device=device)[:k]
+                token_indices = patch_indices + 1  # Add 1 for CLS offset
+                
+                # Always preserve CLS token interactions
+                mask[b, :, :, 0] = 1.0  # All tokens can attend to CLS
+                mask[b, :, 0, :] = 1.0  # CLS can attend to all tokens
+                
+                # Allow interactions with randomly selected patches
+                mask[b, :, :, token_indices] = 1.0  # All can attend TO selected
+                mask[b, :, token_indices, :] = 1.0  # Selected can attend to ALL
+            else:
+                # Randomly select k tokens from all available tokens
+                # MODIFIED: Added device=device argument
+                selected_indices = torch.randperm(N, generator=self.rng, device=device)[:k]
+                mask[b, :, :, selected_indices] = 1.0  # All can attend TO selected
+                mask[b, :, selected_indices, :] = 1.0  # Selected can attend to ALL
 
         pruned_attn = attn_probs * mask
         
@@ -96,21 +100,10 @@ class UCBAttention(nn.Module):
 
         context = torch.matmul(pruned_attn, v)
         
-        # Update counts for selected patches
-        score_delta = torch.zeros_like(count_score_buffer)
-        
-        if self.exclude_cls:
-            for b in range(B):
-                # Each selected patch gets +1/B to normalize across batch
-                score_delta[:, selected_indices[b] + 1] += 1.0 / B
-        else:
-            for b in range(B):
-                score_delta[:, selected_indices[b]] += 1.0 / B
-
-        return context, score_delta
+        return context, None  # No score delta needed for random selection
     
     
-    def forward(self, x, counter, ucb_enabled, ucb_count_score):
+    def forward(self, x, counter, random_enabled):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -118,11 +111,8 @@ class UCBAttention(nn.Module):
         attn_scores = (q @ k.transpose(-1, -2)) * self.scale
         attn_probs = attn_scores.softmax(dim=-1)
 
-        score_delta = None
-        if ucb_enabled and counter > 50:  # Warm-up period
-            context, score_delta = self.ucb_score_pruning(
-                attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
-            )
+        if random_enabled and counter > 50:  # Warm-up period (same as UCB model)
+            context, _ = self.random_score_pruning(attn_scores, attn_probs, v)
         else:
             attn_probs = self.attn_drop(attn_probs)
             context = torch.matmul(attn_probs, v)
@@ -130,11 +120,11 @@ class UCBAttention(nn.Module):
         x = context.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, score_delta
+        return x
 
 
-class UCBBlock(nn.Module):
-    def __init__(self, original_block: nn.Module, **ucb_kwargs):
+class RandomBlock(nn.Module):
+    def __init__(self, original_block: nn.Module, **random_kwargs):
         super().__init__()
         # Copy all components from original block
         self.norm1 = original_block.norm1
@@ -147,32 +137,32 @@ class UCBBlock(nn.Module):
         self.drop_path1 = getattr(original_block, 'drop_path1', nn.Identity())
         self.drop_path2 = getattr(original_block, 'drop_path2', nn.Identity())
 
-        # Replace attention with UCB version
+        # Replace attention with Random version
         orig_attn = original_block.attn
-        self.attn = UCBAttention(
+        self.attn = RandomAttention(
             dim=orig_attn.qkv.in_features,
             num_heads=orig_attn.num_heads,
             qkv_bias=orig_attn.qkv.bias is not None,
             attn_drop=orig_attn.attn_drop.p if hasattr(orig_attn.attn_drop, 'p') else 0.0,
             proj_drop=orig_attn.proj_drop.p if hasattr(orig_attn.proj_drop, 'p') else 0.0,
-            **ucb_kwargs
+            **random_kwargs
         )
         
         # Load weights from original attention
         state_dict = orig_attn.state_dict()
         self.attn.load_state_dict(state_dict, strict=False)
 
-    def forward(self, x, counter, ucb_enabled, ucb_count_score):
+    def forward(self, x, counter, random_enabled):
         # Standard transformer block with residual connections
-        h, score_delta = self.attn(self.norm1(x), counter, ucb_enabled, ucb_count_score)
+        h = self.attn(self.norm1(x), counter, random_enabled)
         x = x + self.drop_path1(self.ls1(h))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x, score_delta
+        return x
 
 
-class ViT_UCB_Pruning(nn.Module):
+class ViT_Random_Pruning(nn.Module):
     def __init__(self, model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=None,
-                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
+                 k=None, keep_ratio=None, exclude_cls=True, random_seed=42):
         super().__init__()
         print(f"Loading source model '{model_name}'...")
         source_model = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
@@ -196,21 +186,15 @@ class ViT_UCB_Pruning(nn.Module):
         self.head = nn.Linear(head_dim, n_classes if n_classes is not None else head_dim)
         self.n_classes = n_classes if n_classes is not None else head_dim
 
-        # Replace blocks with UCB versions
+        # Replace blocks with Random versions
         self.blocks = nn.ModuleList([
-            UCBBlock(block, k=k, keep_ratio=keep_ratio, beta=beta, exclude_cls=exclude_cls) 
-            for block in source_model.blocks
+            RandomBlock(block, k=k, keep_ratio=keep_ratio, exclude_cls=exclude_cls, random_seed=random_seed+i) 
+            for i, block in enumerate(source_model.blocks)
         ])
 
-        # Initialize UCB count buffer
-        num_layers = len(self.blocks)
-        num_heads = self.blocks[0].attn.num_heads
-        num_patches = self.pos_embed.shape[1]  # Total tokens including CLS
+        self.random_seed = random_seed
 
-        # Buffer to track patch selection counts per layer and head
-        self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches))
-
-    def forward(self, x: torch.Tensor, counter: int = 0, ucb_enabled: bool = True, labels: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, counter: int = 0, random_enabled: bool = True, labels: torch.Tensor = None):
         
         x = self.patch_embed(x)
         
@@ -223,16 +207,7 @@ class ViT_UCB_Pruning(nn.Module):
 
         # Process through transformer blocks
         for i, block in enumerate(self.blocks):
-            x, score_delta = block(
-                x, 
-                counter=counter, 
-                ucb_enabled=ucb_enabled, 
-                ucb_count_score=self.ucb_count_scores[i]
-            )
-            
-            # Update counts if pruning was applied
-            if score_delta is not None:
-                self.ucb_count_scores[i] += score_delta
+            x = block(x, counter=counter, random_enabled=random_enabled)
 
         # Final norm and classification
         x = self.norm(x)
@@ -247,11 +222,13 @@ class ViT_UCB_Pruning(nn.Module):
         return logits
 
     def get_pruning_stats(self):
-        """Returns statistics about current pruning configuration and state."""
+        """Returns statistics about current pruning configuration."""
         stats = {
             'num_layers': len(self.blocks),
             'num_heads': self.blocks[0].attn.num_heads,
             'total_patches': self.pos_embed.shape[1],
+            'pruning_method': 'random',
+            'random_seed': self.random_seed
         }
         
         # Add per-layer pruning configuration
@@ -266,9 +243,4 @@ class ViT_UCB_Pruning(nn.Module):
                 stats[f'layer_{i}_keep_ratio'] = block.attn.k / total_patches
                 stats[f'layer_{i}_kept_patches'] = block.attn.k
                 
-        # Add UCB statistics
-        stats['avg_patch_counts'] = self.ucb_count_scores.mean(dim=(0, 1)).cpu().numpy()
-        stats['min_patch_count'] = self.ucb_count_scores.min().item()
-        stats['max_patch_count'] = self.ucb_count_scores.max().item()
-        
         return stats

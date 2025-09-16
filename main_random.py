@@ -11,12 +11,14 @@ from sklearn.model_selection import train_test_split
 
 from src.data.dataset import PatchFromH5Dataset, stratified_split, plot_class_distributions
 from src.rl.train import ModelTrainer, TrainingArguments
-from src.rl.modelling import ViT_UCB_Pruning
+from src.rl.random_pruning import ViT_Random_Pruning
 
 
 # %%
 IMG_SIZE = 224
-TRAIN_BATCH_SIZE = 8
+TRAIN_BATCH_SIZE = 16
+NUM_EPOCHS = 30
+
 
 
 DEVICE = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
@@ -88,25 +90,23 @@ test_loader = DataLoader(test_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=Fals
 
 # %%
 labels_num = len(np.unique(dataset.labels))
+
 print(f"Number of classes: {labels_num}")
 
-NUM_EPOCHS = 30
+PRUNING_RATIOS = [0.05, 0.08, 0.3, 0.5, 0.7]
 
-PRUNING_RATIO = 1
-
-
-model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni", 
+for pruning_ratio in PRUNING_RATIOS:
+    model = ViT_Random_Pruning(model_name="hf-hub:MahmoodLab/uni", 
     pretrained=True, 
     n_classes=labels_num, 
-    keep_ratio=None,  
-    k=None,       
-    exclude_cls=True
-)
+    keep_ratio=pruning_ratio,        
+    exclude_cls=False
+    )
 
     # %%
-args = TrainingArguments(
+    args = TrainingArguments(
             output_dir="./results",
-            run_name=f"ViT-L-UCB-{PRUNING_RATIO}",
+            run_name=f"ViT-L-UCB-{pruning_ratio}",
             num_train_epochs=NUM_EPOCHS,
             evaluation_strategy="epoch",
             learning_rate=0.1,
@@ -121,17 +121,18 @@ args = TrainingArguments(
             report_to="wandb", 
             early_stopping_patience=7, 
             early_stopping_metric="eval/loss", 
+            model_type="random"
         )
 
 
     # %%
-optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     # The scheduler needs max_steps, so we calculate it first
-num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
-scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
+    num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
 
     # %%
-trainer = ModelTrainer(
+    trainer = ModelTrainer(
             model=model,
             args=args,
             train_dataloader=train_loader,
@@ -143,6 +144,7 @@ trainer = ModelTrainer(
         )
 
     # %%
-trainer.train()
+    trainer.train()
+
 
 
