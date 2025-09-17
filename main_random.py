@@ -93,7 +93,7 @@ labels_num = len(np.unique(dataset.labels))
 
 print(f"Number of classes: {labels_num}")
 
-PRUNING_RATIOS = [0.05, 0.08, 0.3, 0.5, 0.7]
+PRUNING_RATIOS = [ 0.08, 0.3, 0.5, 0.7]
 
 for pruning_ratio in PRUNING_RATIOS:
     model = ViT_Random_Pruning(model_name="hf-hub:MahmoodLab/uni", 
