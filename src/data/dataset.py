@@ -30,8 +30,6 @@ class PatchFromH5Dataset(Dataset):
         for label, idx in self.label_str_to_idx.items():
             self.class_names[idx] = label
 
-
-
         self.data_index = []
         # Aggiungeremo una lista per le label numeriche corrispondenti a data_index
         self.labels = [] # Questo sarà il nostro array NumPy delle label pre-calcolate
@@ -81,6 +79,37 @@ class PatchFromH5Dataset(Dataset):
         # Recupera la label direttamente dall'array pre-calcolato
         label_idx = self.labels[idx]
         return patch, torch.tensor(label_idx, dtype=torch.long)
+    
+
+class EagleEmbeddingDataset(Dataset):
+    """
+    Una classe PyTorch Dataset per la lettura di embeddings da un file HDF5.
+    """
+    def __init__(self, h5_file_path: str, metadata_df: pd.DataFrame, label_map: dict):
+        self.h5_file_path = h5_file_path
+        self.metadata = metadata_df
+        self.label_map = label_map
+        self.h5_file = h5py.File(h5_file_path, 'r')
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx: int):
+        # Ottieni l'ID e la label dal DataFrame dei metadati
+        row = self.metadata.iloc[idx]
+        embedding_id = str(row['id'])  # 'id' deve essere una stringa per HDF5
+        label_str = row['oncotree_code']
+        
+        # Converte la stringa della label nell'ID numerico
+        label = self.label_map[label_str]
+        
+        # Accedi all'embedding corrispondente nel file HDF5
+        embedding = self.h5_file[embedding_id][()]  # [()] carica i dati in memoria come array NumPy
+
+        return {'embedding': torch.tensor(embedding, dtype=torch.float32), 'label': torch.tensor(label, dtype=torch.int64)}
+    
+    def close(self):
+        self.h5_file.close()
     
 # --- Funzioni ausiliarie modificate per usare il nuovo attributo labels ---
 
