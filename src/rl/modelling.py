@@ -246,6 +246,76 @@ class ViT_UCB_Pruning(nn.Module):
             
         return logits
 
+    def get_top_k_patch_indices(self, keep_ratio: float):
+        """
+        Analyzes the learned ucb_count_scores to find the most important patch indices.
+
+        Args:
+            keep_ratio (float): The ratio of patches to keep (e.g., 0.7 for 70%).
+
+        Returns:
+            torch.Tensor: A 1D tensor containing the indices of tokens to keep,
+                          including the CLS token.
+        """
+        # Exclude CLS token from importance calculation
+        # Scores are averaged across all layers and heads
+        patch_scores = self.ucb_count_scores[:, :, 1:].mean(dim=(0, 1))
+        
+        num_patches_to_keep = max(1, int(patch_scores.shape[0] * keep_ratio))
+        
+        # Get the indices of the patches with the highest scores
+        top_patch_indices = torch.topk(patch_scores, k=num_patches_to_keep, dim=-1).indices
+        
+        # Add 1 to offset for the CLS token we excluded
+        token_indices = top_patch_indices + 1
+        
+        # Always include the CLS token (index 0)
+        cls_token_index = torch.tensor([0], device=token_indices.device)
+        
+        # Concatenate and sort for predictable order
+        final_indices = torch.cat([cls_token_index, token_indices]).sort().values
+        
+        return final_indices
+
+    def forward_pruned(self, x: torch.Tensor, top_k_indices: torch.Tensor):
+        """
+        A fast inference path that uses a pre-computed set of indices to prune tokens.
+        
+        Args:
+            x (torch.Tensor): The input image tensor.
+            top_k_indices (torch.Tensor): A 1D tensor of token indices to keep.
+        
+        Returns:
+            torch.Tensor: The output logits from the model.
+        """
+        x = self.patch_embed(x)
+        
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        
+        x = self.pos_drop(x + self.pos_embed)
+
+        # --- This is the key step for computational speedup ---
+        # Select only the tokens (CLS + top patches) that we want to keep
+        x = torch.index_select(x, dim=1, index=top_k_indices.to(x.device))
+        # ---------------------------------------------------------
+
+        # Process the reduced set of tokens through the transformer blocks
+        # We disable UCB logic since pruning is already done
+        for i, block in enumerate(self.blocks):
+            x, _ = block(
+                x, 
+                counter=99999,      # Counter doesn't matter
+                ucb_enabled=False,  # IMPORTANT: Disable UCB during this pruned forward pass
+                ucb_count_score=None # UCB scores are not needed
+            )
+            
+        # Final norm and classification (CLS token is still at index 0)
+        x = self.norm(x)
+        logits = self.head(x[:, 0])
+        
+        return logits
+
     def get_pruning_stats(self):
         """Returns statistics about current pruning configuration and state."""
         stats = {
