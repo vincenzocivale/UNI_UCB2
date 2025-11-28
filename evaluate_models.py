@@ -44,16 +44,30 @@ undersampled_df = (
       .apply(lambda x: x.sample(n=min_count, random_state=42)).reset_index(drop=True)
 )
 undersampled_indices = undersampled_df["index"].sample(frac=1, random_state=42).tolist()
+
 undersampled_labels = [labels[i] for i in undersampled_indices]
 
-_, test_idx = train_test_split(
+trainval_idx, test_idx = train_test_split(
     undersampled_indices,
     test_size=0.3,
     stratify=undersampled_labels,
     random_state=42
 )
 
-test_dataset = Subset(dataset, test_idx)
+# Ottieni i label corrispondenti per il secondo split
+trainval_labels = [labels[i] for i in trainval_idx]
+
+# Split: train vs val
+train_idx, val_idx = train_test_split(
+    trainval_idx,
+    test_size=0.3,
+    stratify=trainval_labels,
+    random_state=42
+)
+
+
+test_dataset  = Subset(dataset, test_idx)
+
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=16, drop_last=False)
 print(f"Test set loaded with {len(test_dataset)} samples.")
 
@@ -81,6 +95,7 @@ for model_path in sorted(model_paths):
         path_parts = model_path.split(os.sep)
         # es: './results/70/pytorch_model.bin' -> '70'
         # es: './results/baseline/pytorch_model.bin' -> 'baseline'
+        print(path_parts)
         ratio_str = path_parts[-2]
         if ratio_str == 'baseline':
             keep_ratio = 1.0
@@ -92,6 +107,8 @@ for model_path in sorted(model_paths):
 
     print(f"\n--- Evaluating model for keep_ratio: {keep_ratio} ---")
     print(f"Model path: {model_path}")
+    print(keep_ratio)
+    print(f"Evaluating model with labels num: {labels_num}")
 
     # Carica il modello
     model = ViT_UCB_Pruning(
@@ -109,7 +126,6 @@ for model_path in sorted(model_paths):
     all_labels = []
     total_inference_time = 0
     
-    # Pre-calcola gli indici per il pruning se necessario
     top_k_indices = None
     if keep_ratio < 1.0:
         try:
@@ -148,7 +164,7 @@ for model_path in sorted(model_paths):
             all_labels.extend(labels.cpu().numpy())
 
     # Calcola metriche
-    avg_inference_time_ms = (total_inference_time / len(test_dataset)) * 1000
+    avg_inference_time_ms = (total_inference_time / len(test_loader)) * 1000
     f1 = f1_score(all_labels, all_preds, average='weighted')
 
     print(f"F1-Score (Weighted): {f1:.4f}")

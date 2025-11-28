@@ -16,11 +16,11 @@ from src.rl.modelling import ViT_UCB_Pruning
 
 # %%
 IMG_SIZE = 224
-TRAIN_BATCH_SIZE = 12
-NUM_EPOCHS = 50
+TRAIN_BATCH_SIZE = 1
+NUM_EPOCHS = 30
 
 # Questo è il rapporto di pruning usato durante il TRAINING
-TRAINING_KEEP_RATIO = 0.8
+TRAINING_KEEP_RATIO = 0.3 # Aumentato da 0.01 per un training più stabile
 
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -84,9 +84,9 @@ test_dataset  = Subset(dataset, test_idx)
 plot_class_distributions(train_dataset, val_dataset, test_dataset, full_dataset=dataset)
 
 # %%
-train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=8, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=8, drop_last=True)
-test_loader = DataLoader(test_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=8, drop_last=True)
+train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=16, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, num_workers=16, drop_last=True)
 
 # %%
 labels_num = len(np.unique(dataset.labels))
@@ -101,26 +101,34 @@ model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni",
 
 # %%
 args = TrainingArguments(
-        output_dir=f"./results2/keep_ratio_{TRAINING_KEEP_RATIO}",
-        run_name=f"ViT-UCB-Training-keep_ratio-{TRAINING_KEEP_RATIO}",
+        output_dir="./results/frozen", # Salvataggio in una cartella dedicata per i modelli frozen
+        run_name=f"ViT-UCB-Frozen-keep_ratio-{TRAINING_KEEP_RATIO}",
         num_train_epochs=NUM_EPOCHS,
         evaluation_strategy="epoch",
         learning_rate=0.01,
-        train_batch_size=TRAIN_BATCH_SIZE,
-        eval_batch_size=TRAIN_BATCH_SIZE,
+        train_batch_size=8,
+        eval_batch_size=8,
         max_steps=-1,
         warmup_steps=500,
-        eval_steps=100,
+        eval_steps=5000,
         save_steps=10000,
         logging_steps=300,
         fp16=False, # Impostato a False, GradScaler non verrà usato
         report_to="wandb", 
+        freeze_backbone=True, # Attiva il congelamento del backbone
     )
 
 # %%
-optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+# L'ottimizzatore verrà creato solo con i parametri che hanno requires_grad=True
+optimizer = torch.optim.SGD(
+    filter(lambda p: p.requires_grad, model.parameters()), 
+    lr=args.learning_rate, 
+    weight_decay=args.weight_decay
+)
 # The scheduler needs max_steps, so we calculate it first
-num_steps = args.num_train_epochs * (len(train_loader) // args.gradient_accumulation_steps)
+# Calcola il numero di passi di training tenendo conto dell'accumulazione dei gradienti
+num_update_steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+num_steps = args.num_train_epochs * num_update_steps_per_epoch
 scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=num_steps)
 
 # %%
@@ -140,13 +148,13 @@ trainer = ModelTrainer(
 trainer.train()
 
 # %% [markdown]
-# ## Benchmark di Velocità Post-Training
+# ## Benchmark di Velocità Post-Training (Modello con Backbone Congelato)
 # 
-# Dopo aver completato l'addestramento, la cella seguente eseguirà un benchmark per misurare la velocità di inferenza del modello potato. Questo test:
+# Dopo aver completato l'addestramento, la cella seguente eseguirà un benchmark per misurare la velocità di inferenza del modello potato con backbone congelato. Questo test:
 # 1. Usa il modello appena addestrato.
 # 2. Calcola quali token tenere (`top_k_indices`) basandosi sui punteggi UCB appresi.
 # 3. Misura il tempo medio di inferenza usando il metodo `forward_pruned`.
-# 4. Logga questo risultato in un nuovo progetto su W&B chiamato `vit-ucb-pruning-final` per un'analisi chiara e separata.
+# 4. Logga questo risultato in un nuovo progetto su W&B chiamato `vit-ucb-pruning-frozen-final` per un'analisi chiara e separata.
 
 # %%
 # --- Benchmark di Velocità di Inferenza Post-Training ---
@@ -180,8 +188,7 @@ if top_k_indices is not None:
     # 3. Esegui il benchmark (con warmup)
     print(f"Esecuzione di {WARMUP_RUNS} warmup runs...")
     with torch.no_grad():
-        for _ in range(WARMUP_RUNS):
-            _ = trained_model.forward_pruned(dummy_input, top_k_indices)
+        _ = trained_model.forward_pruned(dummy_input, top_k_indices)
     if DEVICE.type == 'cuda':
         torch.cuda.synchronize()
 
@@ -206,7 +213,7 @@ if top_k_indices is not None:
     print("Logging della metrica di velocità su Weights & Biases...")
     try:
         wandb.init(
-            project="vit-ucb-pruning-final", 
+            project="vit-ucb-pruning-frozen-final", # Progetto W&B dedicato ai modelli frozen
             name=f"{args.run_name}-inference-benchmark",
             config={
                 "inference_keep_ratio": INFERENCE_KEEP_RATIO,
@@ -219,5 +226,3 @@ if top_k_indices is not None:
         print("Metrica loggata con successo!")
     except Exception as e:
         print(f"Errore durante il logging su W&B: {e}")
-
-

@@ -59,6 +59,7 @@ class TrainingArguments:
     save_best_model: bool = True
     # New parameter to specify model type
     model_type: str = "ucb"  # "ucb", "random", or "baseline"
+    freeze_backbone: bool = False # Nuovo argomento per congelare il backbone
 
 class ModelTrainer:
     def __init__(
@@ -96,6 +97,7 @@ class ModelTrainer:
         self.device = device if device is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.model.to(self.device)
 
+
         # Inizializza optimizer e scheduler
         optimizer, scheduler = optimizers
         self.optimizer = optimizer if optimizer is not None else self.create_optimizer()
@@ -113,7 +115,7 @@ class ModelTrainer:
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
         # Gestione dei checkpoint
-        self._checkpoints = deque(maxlen=self.args.save_total_limit) if self.args.save_total_limit is not None and self.args.save_total_limit > 0 else None
+        self._checkpoints = [] if self.args.save_total_limit is not None and self.args.save_total_limit > 0 else None
 
         # Inizializzazione per l'early stopping
         self.patience_counter = 0
@@ -162,6 +164,7 @@ class ModelTrainer:
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{int(self.args.num_train_epochs)}", leave=False)
             
             for step, batch in enumerate(progress_bar):
+                # FIX: Passa global_step come counter (era mancante!)
                 loss = self._training_step(batch, counter=global_step)
                 train_loss += loss.item()
 
@@ -172,15 +175,21 @@ class ModelTrainer:
                     self.scaler.update()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
+                    
+                    # DEBUG: Aggiungi log per verificare global_step
+                    if global_step % 100 == 0:
+                        logger.info(f"[DEBUG TRAIN] Global step: {global_step}")
+                    
                     global_step += 1
 
-                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"})
+                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{self.scheduler.get_last_lr()[0]:.2e}", "step": global_step})
 
                     # Logging
                     if global_step % self.args.logging_steps == 0:
                         metrics_to_log = {
                             "train/loss": train_loss / self.args.logging_steps,
-                            "train/learning_rate": self.scheduler.get_last_lr()[0]
+                            "train/learning_rate": self.scheduler.get_last_lr()[0],
+                            "train/global_step": global_step  # Aggiungi per debug
                         }
                         if pruning_logging:
                             self._log_pruning_metrics(metrics_to_log)
@@ -217,6 +226,7 @@ class ModelTrainer:
                 break
         
         self.finalize_training(global_step, best_model_path=best_model_path)
+
 
     def finalize_training(self, global_step: int, best_model_path: Optional[str] = None):
         """Esegue i passaggi finali dopo il completamento del training."""
@@ -258,26 +268,41 @@ class ModelTrainer:
     def _forward_pass(self, inputs: torch.Tensor, labels: Optional[torch.Tensor], counter: int, training: bool = True):
         """Universal forward pass that works with all model types."""
         if self.model_type == "ucb":
-            return self.model(x=inputs, labels=labels, counter=counter, ucb_enabled=training)
+            keep_ratio = getattr(self.model, 'keep_ratio', 1.0)
+            
+            if training:
+                # Training: usa UCB per esplorare e selezionare dinamicamente le patch
+                # poi applica pruning fisico
+                return self.model(x=inputs, labels=labels, counter=counter, ucb_enabled=True)
+            else:
+                # Validation: pruning deterministico con top-k patches apprese
+                with torch.no_grad():
+                    if keep_ratio < 1.0:
+                        top_k_indices = self.model.get_top_k_patch_indices(keep_ratio=keep_ratio)
+                        logits = self.model.forward_pruned(inputs, top_k_indices.to(self.device))
+                    else:
+                        output = self.model(x=inputs, labels=None, ucb_enabled=False)
+                        logits = output.logits if hasattr(output, 'logits') else output
+
+                    loss = None
+                    if labels is not None:
+                        loss_fct = nn.CrossEntropyLoss()
+                        loss = loss_fct(logits, labels)
+                    return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
+        
         elif self.model_type == "random":
             return self.model(x=inputs, labels=labels, counter=counter, random_enabled=training)
-        else:
-            # Baseline model - just standard forward pass
+        else: # Baseline
+            output = self.model(inputs)
+            logits = output.logits if hasattr(output, 'logits') else output
+            loss = None
             if labels is not None:
-                # If model supports loss calculation
-                try:
-                    return self.model(x=inputs, labels=labels)
-                except:
-                    # Fallback to manual loss calculation
-                    logits = self.model(inputs)
-                    loss_fct = nn.CrossEntropyLoss()
-                    loss = loss_fct(logits, labels)
-                    return loss, logits
-            else:
-                return self.model(inputs)
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits, labels)
+            return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
 
     def evaluate(self, counter: int, return_preds: bool = False) -> Union[Dict[str, float], Tuple[Dict[str, float], list, list]]:
-        logger.info(f"***** Esecuzione Valutazione allo Step {counter} *****")
+        print(f"***** Esecuzione Valutazione allo Step {counter} *****")
         self.model.eval()
 
         total_loss, total_correct, total_samples = 0, 0, 0
@@ -413,14 +438,16 @@ class ModelTrainer:
         logger.info(f"Salvataggio del checkpoint del modello in {output_path}")
         torch.save(self.model.state_dict(), ckpt_path)
         
-        # Gestisce il limite di checkpoint da salvare
+        # Gestisce il limite di checkpoint da salvare (LOGICA CORRETTA)
         if self._checkpoints is not None and not is_best and not final:
-            if len(self._checkpoints) == self._checkpoints.maxlen:
-                oldest_ckpt = self._checkpoints.popleft()
+            self._checkpoints.append(output_path)
+            if len(self._checkpoints) > self.args.save_total_limit:
+                oldest_ckpt = self._checkpoints.pop(0) # Rimuovi il più vecchio (il primo della lista)
                 if os.path.exists(oldest_ckpt):
                     logger.info(f"Rimozione del vecchio checkpoint: {oldest_ckpt}")
                     shutil.rmtree(oldest_ckpt)
-            self._checkpoints.append(output_path)
+                else:
+                    logger.warning(f"Il vecchio checkpoint non è stato trovato a: {oldest_ckpt}, impossibile rimuoverlo.")
             
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
             aliases = []

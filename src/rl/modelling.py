@@ -40,12 +40,34 @@ class UCBAttention(nn.Module):
             patch_start_idx = 0
 
         if self.keep_ratio is not None:
-            k = max(1, int(total_patches * self.keep_ratio))
+            # FIX: Gestisci correttamente keep_ratio=0
+            if self.keep_ratio <= 0:
+                k = 0  # Prune TUTTE le patch (mantieni solo CLS)
+            else:
+                k = max(1, int(total_patches * self.keep_ratio))
         elif self.k is not None:
             k = min(self.k, total_patches)
         else:
             # If no pruning specified, return original attention
             return torch.matmul(self.attn_drop(attn_probs), v), None
+
+        # Se k=0, restituisci solo l'attenzione sul CLS token
+        if k == 0 and self.exclude_cls:
+            # Crea una maschera che mantiene solo il CLS token
+            mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
+            mask[:, :, :, 0] = 1.0  # Tutti possono attendere al CLS
+            mask[:, :, 0, :] = 1.0  # CLS può attendere a tutti
+            
+            pruned_attn = attn_probs * mask
+            pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
+            pruned_attn = self.attn_drop(pruned_attn)
+            context = torch.matmul(pruned_attn, v)
+            
+            # FIX: Nessun aggiornamento degli score perché nessuna patch è selezionata
+            # Ma incrementa comunque il CLS token per tracking
+            score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
+            score_delta[:, 0] += 1.0  # Solo CLS viene "selezionato"
+            return context, score_delta
 
         # Calculate patch importance scores - using attention received by each patch
         if self.exclude_cls:
@@ -68,7 +90,7 @@ class UCBAttention(nn.Module):
         global_ucb_scores = ucb_scores.mean(dim=1)  # (B, num_patches)
         _, selected_indices = torch.topk(global_ucb_scores, k=k, dim=-1)  # (B, k)
 
-        # Create attention mask - USE YOUR ORIGINAL APPROACH (more permissive)
+        # Create attention mask
         mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
         
         if self.exclude_cls:
@@ -97,15 +119,19 @@ class UCBAttention(nn.Module):
         context = torch.matmul(pruned_attn, v)
         
         # Update counts for selected patches
-        score_delta = torch.zeros_like(count_score_buffer)
+        # FIX: Assicurati che score_delta sia un tensor float, non int
+        score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
         
         if self.exclude_cls:
             for b in range(B):
                 # Each selected patch gets +1/B to normalize across batch
-                score_delta[:, selected_indices[b] + 1] += 1.0 / B
+                # FIX: Converti selected_indices in long per indexing sicuro
+                indices_to_update = (selected_indices[b] + 1).long()
+                score_delta[:, indices_to_update] += 1.0 / B
         else:
             for b in range(B):
-                score_delta[:, selected_indices[b]] += 1.0 / B
+                indices_to_update = selected_indices[b].long()
+                score_delta[:, indices_to_update] += 1.0 / B
 
         return context, score_delta
     
@@ -119,11 +145,13 @@ class UCBAttention(nn.Module):
         attn_probs = attn_scores.softmax(dim=-1)
 
         score_delta = None
-        if ucb_enabled and counter > 50:  # Warm-up period
+        # FIX: Applica pruning SOLO se ucb_enabled=True E dopo warm-up
+        if ucb_enabled and counter > 50:
             context, score_delta = self.ucb_score_pruning(
                 attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
             )
         else:
+            # Nessun pruning - attention standard
             attn_probs = self.attn_drop(attn_probs)
             context = torch.matmul(attn_probs, v)
 
@@ -177,6 +205,8 @@ class ViT_UCB_Pruning(nn.Module):
         print(f"Loading source model '{model_name}'...")
         source_model = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
 
+        self.keep_ratio = keep_ratio
+
         # Copy patch embedding and positional components
         self.patch_embed = source_model.patch_embed
         self.cls_token = source_model.cls_token
@@ -211,39 +241,45 @@ class ViT_UCB_Pruning(nn.Module):
         self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches))
 
     def forward(self, x: torch.Tensor, counter: int = 0, ucb_enabled: bool = True, labels: torch.Tensor = None):
-        
         x = self.patch_embed(x)
-        
-        # Add CLS token
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        
-        # Add positional embedding
         x = self.pos_drop(x + self.pos_embed)
 
-        # Process through transformer blocks
+        # DEBUG: Aggiungi logging per verificare counter e ucb_enabled
+        if counter % 100 == 0:
+            print(f"[DEBUG] Counter={counter}, UCB_enabled={ucb_enabled}, Warmup_passed={counter > 50}")
+
+        # FIX: Rimuovi il pruning fisico preliminare, lascia che UCB lo gestisca nei blocchi
+        # Process through blocks con UCB ABILITATO
         for i, block in enumerate(self.blocks):
             x, score_delta = block(
                 x, 
                 counter=counter, 
-                ucb_enabled=ucb_enabled, 
+                ucb_enabled=ucb_enabled,  # FIX: Passa il vero valore di ucb_enabled
                 ucb_count_score=self.ucb_count_scores[i]
             )
             
-            # Update counts if pruning was applied
-            if score_delta is not None:
-                self.ucb_count_scores[i] += score_delta
-
-        # Final norm and classification
-        x = self.norm(x)
-        logits = self.head(x[:, 0])  # Use CLS token for classification
-
-        # Compute loss if labels provided
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-            return loss, logits
+            # DEBUG: Verifica se score_delta viene calcolato
+            if counter % 100 == 0 and i == 0:
+                print(f"[DEBUG] Layer {i}: score_delta is {'None' if score_delta is None else 'not None'}")
+                if score_delta is not None:
+                    print(f"[DEBUG] score_delta shape: {score_delta.shape}, mean: {score_delta.mean().item():.4f}")
+                    print(f"[DEBUG] UCB scores before update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
             
+            if score_delta is not None:
+                # FIX: Usa .data per aggiornare il buffer senza interferire con autograd
+                self.ucb_count_scores[i].data += score_delta.data
+                
+            if counter % 100 == 0 and i == 0 and score_delta is not None:
+                print(f"[DEBUG] UCB scores after update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
+
+        x = self.norm(x)
+        logits = self.head(x[:, 0])
+
+        if labels is not None:
+            loss = nn.CrossEntropyLoss()(logits, labels)
+            return loss, logits
         return logits
 
     def get_top_k_patch_indices(self, keep_ratio: float):
@@ -260,6 +296,11 @@ class ViT_UCB_Pruning(nn.Module):
         # Exclude CLS token from importance calculation
         # Scores are averaged across all layers and heads
         patch_scores = self.ucb_count_scores[:, :, 1:].mean(dim=(0, 1))
+        
+        # FIX: Gestisci keep_ratio=0
+        if keep_ratio <= 0:
+            # Ritorna solo il CLS token
+            return torch.tensor([0], device=patch_scores.device)
         
         num_patches_to_keep = max(1, int(patch_scores.shape[0] * keep_ratio))
         
@@ -278,36 +319,23 @@ class ViT_UCB_Pruning(nn.Module):
         return final_indices
 
     def forward_pruned(self, x: torch.Tensor, top_k_indices: torch.Tensor):
-        """
-        A fast inference path that uses a pre-computed set of indices to prune tokens.
-        
-        Args:
-            x (torch.Tensor): The input image tensor.
-            top_k_indices (torch.Tensor): A 1D tensor of token indices to keep.
-        
-        Returns:
-            torch.Tensor: The output logits from the model.
-        """
         x = self.patch_embed(x)
-        
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        
         x = self.pos_drop(x + self.pos_embed)
 
-        # --- This is the key step for computational speedup ---
-        # Select only the tokens (CLS + top patches) that we want to keep
+        print(f"PRUNING: Tensor shape before: {x.shape[1]} tokens")
         x = torch.index_select(x, dim=1, index=top_k_indices.to(x.device))
-        # ---------------------------------------------------------
+        print(f"PRUNING: Tensor shape after: {x.shape[1]} tokens")
 
         # Process the reduced set of tokens through the transformer blocks
         # We disable UCB logic since pruning is already done
         for i, block in enumerate(self.blocks):
             x, _ = block(
                 x, 
-                counter=99999,      # Counter doesn't matter
-                ucb_enabled=False,  # IMPORTANT: Disable UCB during this pruned forward pass
-                ucb_count_score=None # UCB scores are not needed
+                counter=99999,
+                ucb_enabled=False,  # Disabilita UCB durante inferenza pruned
+                ucb_count_score=None
             )
             
         # Final norm and classification (CLS token is still at index 0)
