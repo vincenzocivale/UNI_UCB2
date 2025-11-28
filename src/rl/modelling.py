@@ -145,8 +145,8 @@ class UCBAttention(nn.Module):
         attn_probs = attn_scores.softmax(dim=-1)
 
         score_delta = None
-        # FIX: Applica pruning SOLO se ucb_enabled=True E dopo warm-up
-        if ucb_enabled and counter > 50:
+        # FIX: RIDOTTO WARMUP da 50 a 10 per attivare UCB prima
+        if ucb_enabled and counter > 10:  # ← ERA 50, ORA 10
             context, score_delta = self.ucb_score_pruning(
                 attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
             )
@@ -246,9 +246,9 @@ class ViT_UCB_Pruning(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        # DEBUG: Aggiungi logging per verificare counter e ucb_enabled
-        if counter % 100 == 0:
-            print(f"[DEBUG] Counter={counter}, UCB_enabled={ucb_enabled}, Warmup_passed={counter > 50}")
+        # DEBUG: Aggiungi logging SEMPRE per verificare counter e ucb_enabled
+        if counter % 10 == 0:  # FIX: Log più frequente
+            print(f"[DEBUG FORWARD] Counter={counter}, UCB_enabled={ucb_enabled}, Warmup_passed={counter > 50}, keep_ratio={self.keep_ratio}")
 
         # FIX: Rimuovi il pruning fisico preliminare, lascia che UCB lo gestisca nei blocchi
         # Process through blocks con UCB ABILITATO
@@ -261,18 +261,22 @@ class ViT_UCB_Pruning(nn.Module):
             )
             
             # DEBUG: Verifica se score_delta viene calcolato
-            if counter % 100 == 0 and i == 0:
-                print(f"[DEBUG] Layer {i}: score_delta is {'None' if score_delta is None else 'not None'}")
+            if counter % 10 == 0 and i == 0:  # FIX: Log più frequente
+                print(f"[DEBUG LAYER {i}] score_delta={'None' if score_delta is None else 'SET'}, ucb_enabled={ucb_enabled}, counter={counter}")
                 if score_delta is not None:
-                    print(f"[DEBUG] score_delta shape: {score_delta.shape}, mean: {score_delta.mean().item():.4f}")
-                    print(f"[DEBUG] UCB scores before update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
+                    print(f"[DEBUG LAYER {i}] score_delta shape: {score_delta.shape}, mean: {score_delta.mean().item():.6f}, max: {score_delta.max().item():.6f}")
+                    print(f"[DEBUG LAYER {i}] UCB scores BEFORE - mean: {self.ucb_count_scores[i].mean().item():.6f}, std: {self.ucb_count_scores[i].std().item():.6f}")
+                else:
+                    print(f"[DEBUG LAYER {i}] NO PRUNING - counter={counter}, warmup_threshold=50")
             
             if score_delta is not None:
                 # FIX: Usa .data per aggiornare il buffer senza interferire con autograd
+                old_mean = self.ucb_count_scores[i].mean().item()
                 self.ucb_count_scores[i].data += score_delta.data
+                new_mean = self.ucb_count_scores[i].mean().item()
                 
-            if counter % 100 == 0 and i == 0 and score_delta is not None:
-                print(f"[DEBUG] UCB scores after update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
+                if counter % 10 == 0 and i == 0:  # FIX: Log più frequente
+                    print(f"[DEBUG LAYER {i}] UCB scores AFTER - mean: {new_mean:.6f} (delta: {new_mean - old_mean:.6f})")
 
         x = self.norm(x)
         logits = self.head(x[:, 0])
