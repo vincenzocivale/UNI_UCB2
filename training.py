@@ -17,10 +17,10 @@ from src.rl.modelling import ViT_UCB_Pruning
 # %%
 IMG_SIZE = 224
 TRAIN_BATCH_SIZE = 12
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 
 # Questo è il rapporto di pruning usato durante il TRAINING
-TRAINING_KEEP_RATIO = 0.8
+TRAINING_KEEP_RATIO = 0.3
 
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -54,7 +54,7 @@ undersampled_df = (
 # Mischia gli indici
 undersampled_indices = undersampled_df["index"].sample(frac=1, random_state=42).tolist()
 
-# %%
+
 undersampled_labels = [labels[i] for i in undersampled_indices]
 
 trainval_idx, test_idx = train_test_split(
@@ -101,7 +101,7 @@ model = ViT_UCB_Pruning(model_name="hf-hub:MahmoodLab/uni",
 
 # %%
 args = TrainingArguments(
-        output_dir=f"./results2/keep_ratio_{TRAINING_KEEP_RATIO}",
+        output_dir=f"./results3/keep_ratio_{TRAINING_KEEP_RATIO}",
         run_name=f"ViT-UCB-Training-keep_ratio-{TRAINING_KEEP_RATIO}",
         num_train_epochs=NUM_EPOCHS,
         evaluation_strategy="epoch",
