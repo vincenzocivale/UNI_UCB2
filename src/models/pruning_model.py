@@ -243,13 +243,14 @@ class VisionTransformerUCB(nn.Module):
 
         self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches))
 
-    def forward(self, x: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None, top_k_indices: torch.Tensor = None):
+    def forward(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None, top_k_indices: torch.Tensor = None):
         if top_k_indices is not None:
-             return self.forward_pruned(x, top_k_indices, labels)
+             return self.forward_pruned(pixel_values, top_k_indices, labels)
         else:
-             return self.forward_dynamic(x, counter, pruning_enabled, labels)
+             return self.forward_dynamic(pixel_values, counter, pruning_enabled, labels)
 
-    def forward_dynamic(self, x: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None):
+    def forward_dynamic(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None):
+        x = pixel_values
         x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -296,7 +297,8 @@ class VisionTransformerUCB(nn.Module):
         
         return final_indices
 
-    def forward_pruned(self, x: torch.Tensor, top_k_indices: torch.Tensor, labels: torch.Tensor = None):
+    def forward_pruned(self, pixel_values: torch.Tensor, top_k_indices: torch.Tensor, labels: torch.Tensor = None):
+        x = pixel_values
         x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -310,7 +312,7 @@ class VisionTransformerUCB(nn.Module):
                 counter=99999,
                 pruning_enabled=False,
                 ucb_count_score=None,
-                selection_mode='ucb' # Mode doesn't matter here
+                selection_mode=self.selection_mode
             )
             
         x = self.norm(x)

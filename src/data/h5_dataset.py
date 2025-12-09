@@ -64,4 +64,4 @@ class H5PatchDataset(Dataset):
             patch = self.transform(patch)
 
         label_idx = self.labels[idx]
-        return patch, torch.tensor(label_idx, dtype=torch.long)
+        return {'pixel_values': patch, 'labels': torch.tensor(label_idx, dtype=torch.long)}

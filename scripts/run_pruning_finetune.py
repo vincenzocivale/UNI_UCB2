@@ -1,17 +1,25 @@
 
+import sys
+import os
+
+# Add the project root to the Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import argparse
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Subset
-from transformers import TrainingArguments, get_cosine_schedule_with_warmup
+from transformers import TrainingArguments, get_cosine_schedule_with_warmup, EarlyStoppingCallback
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-import os
+import wandb # Import wandb for logging
+import time # Import time for inference time measurement
 
 from src.data.h5_dataset import H5PatchDataset
 from src.models.pruning_model import VisionTransformerUCB
-from src.trainer.ucb_trainer import UcbTrainer
+from src.trainer.ucb_trainer import UcbTrainer, compute_metrics
+from src.utils.performance import calculate_pruning_performance # Import the new utility
 
 def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -90,10 +98,10 @@ def main(args):
         learning_rate=args.learning_rate,
         warmup_steps=200,
         report_to="wandb" if args.use_wandb else "none",
-        fp16=torch.cuda.is_available(),
+        fp16=False,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model="eval_f1_macro",
+        greater_is_better=True,
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
@@ -112,9 +120,36 @@ def main(args):
         eval_dataset=val_dataset,
         optimizers=(optimizer, scheduler),
         top_k_indices=top_k_indices, # Pass the frozen indices
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
     )
 
+    # --- Pruning Performance Measurement and Logging ---
+    print("--- Measuring Pruning Performance (FLOPs & Inference Time) ---")
+    dummy_input_tensor = torch.randn(1, 3, args.img_size, args.img_size) # Single image dummy input
+    performance_metrics = calculate_pruning_performance(model, dummy_input_tensor, top_k_indices, device)
+    
+    print(f"Inference Time (ms): {performance_metrics['inference_time_ms']:.3f}")
+    print(f"FLOPs: {performance_metrics['flops'] / 1e9:.2f} GFLOPs") # Convert to GFLOPs
+
+    if args.use_wandb:
+        # Ensure wandb is initialized, if not already by Trainer
+        if wandb.run is None:
+            wandb.init(project=training_args.project, name=f"{run_name}-performance", config=args)
+        wandb.log({
+            "pruning_inference_time_ms": performance_metrics['inference_time_ms'],
+            "pruning_flops_g": performance_metrics['flops'] / 1e9,
+        })
+        # If Trainer initiated wandb.run, it will be continued here.
+        # If we initiated it, it needs to be finished after logging.
+        # However, it's better to let Trainer manage the run lifecycle.
+
     trainer.train()
+
+    if test_dataset:
+        test_results = trainer.predict(test_dataset)
+        trainer.log_metrics("test", test_results.metrics)
+        trainer.save_metrics("test", test_results.metrics)
 
     print("--- Phase 2 Fine-tuning Finished ---")
     print(f"Best model checkpoint saved to {trainer.state.best_model_checkpoint}")
@@ -135,6 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="hf-hub:MahmoodLab/uni", help="Name of the pretrained model from timm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--use_wandb", action='store_true', help="Flag to enable WandB logging.")
+    parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping.")
 
     args = parser.parse_args()
     main(args)
+

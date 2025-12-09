@@ -1,16 +1,21 @@
+import sys
+import os
+
+# Add the project root to the Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
 import torch
 import torchvision.transforms as transforms
 from torch.utils.data import Subset, DataLoader
-from transformers import TrainingArguments, get_cosine_schedule_with_warmup
+from transformers import TrainingArguments, get_cosine_schedule_with_warmup, EarlyStoppingCallback
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
 from src.data.h5_dataset import H5PatchDataset
 from src.models.pruning_model import VisionTransformerUCB
-from src.trainer.ucb_trainer import UcbTrainer
+from src.trainer.ucb_trainer import UcbTrainer, compute_metrics
 
 def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -72,10 +77,10 @@ def main(args):
         learning_rate=args.learning_rate,
         warmup_steps=500,
         report_to="wandb" if args.use_wandb else "none",
-        fp16=torch.cuda.is_available(),
+        fp16=False,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
+        metric_for_best_model="eval_f1_macro",
+        greater_is_better=True,
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
@@ -93,9 +98,16 @@ def main(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         optimizers=(optimizer, scheduler),
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)],
     )
 
     trainer.train()
+
+    if test_dataset:
+        test_results = trainer.predict(test_dataset)
+        trainer.log_metrics("test", test_results.metrics)
+        trainer.save_metrics("test", test_results.metrics)
 
     print("--- Phase 1 Training Finished ---")
     print(f"Best model checkpoint saved to {trainer.state.best_model_checkpoint}")
@@ -109,11 +121,12 @@ if __name__ == "__main__":
     parser.add_argument("--img_size", type=int, default=224, help="Image size.")
     parser.add_argument("--batch_size", type=int, default=12, help="Batch size for training and evaluation.")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=0.01, help="Learning rate.")
+    parser.add_argument("--learning_rate", type=float, default=0.001, help="Learning rate.")
     parser.add_argument("--training_keep_ratio", type=float, default=0.3, help="Keep ratio for UCB training.")
     parser.add_argument("--model_name", type=str, default="hf-hub:MahmoodLab/uni", help="Name of the pretrained model from timm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--use_wandb", action='store_true', help="Flag to enable WandB logging.")
+    parser.add_argument("--early_stopping_patience", type=int, default=5, help="Patience for early stopping.")
 
     args = parser.parse_args()
     main(args)
