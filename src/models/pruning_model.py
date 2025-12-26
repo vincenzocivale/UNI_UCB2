@@ -42,52 +42,80 @@ class UCBAttention(nn.Module):
     def random_pruning(self, attn_probs, v):
         """
         Applies random patch pruning.
+        Returns context, None, and the indices of kept and removed tokens.
         """
-        B, H, N, _ = attn_probs.shape
+        B, H, N, D = v.shape # D is head_dim
         device = v.device
-        k = self._get_k(N)
+        k_patches_to_keep = self._get_k(N)
 
-        if k >= (N - 1 if self.exclude_cls else N):
-            return torch.matmul(self.attn_drop(attn_probs), v), None
+        if k_patches_to_keep >= (N - 1 if self.exclude_cls else N):
+            kept_token_indices_list = [torch.arange(1, N, device=device, dtype=torch.long) for _ in range(B)] if self.exclude_cls else [torch.arange(N, device=device, dtype=torch.long) for _ in range(B)]
+            removed_token_indices_list = [torch.tensor([], device=device, dtype=torch.long) for _ in range(B)]
+            return torch.matmul(self.attn_drop(attn_probs), v), None, kept_token_indices_list, removed_token_indices_list
 
-        # Randomly select indices for each item in the batch
-        patch_indices = np.arange(1, N) if self.exclude_cls else np.arange(N)
-        selected_indices = torch.tensor(
-            [np.random.choice(patch_indices, k, replace=False) for _ in range(B)],
-            device=device,
-            dtype=torch.long
-        )
+        if k_patches_to_keep == 0 and self.exclude_cls:
+            kept_token_indices_list = [torch.tensor([], device=device, dtype=torch.long) for _ in range(B)]
+            removed_token_indices_list = [torch.arange(1, N, device=device, dtype=torch.long) for _ in range(B)]
+            mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
+            mask[:, :, :, 0] = 1.0
+            mask[:, :, 0, :] = 1.0
+            pruned_attn = attn_probs * mask
+            pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
+            context = torch.matmul(self.attn_drop(pruned_attn), v)
+            return context, None, kept_token_indices_list, removed_token_indices_list # No score delta for random pruning
 
+        patch_indices_relative = np.arange(N - (1 if self.exclude_cls else 0))
+        
+        kept_token_indices_list = []
+        removed_token_indices_list = []
+        
+        for b in range(B):
+            selected_patch_indices_relative_b = np.random.choice(patch_indices_relative, k_patches_to_keep, replace=False)
+            kept_token_indices_list.append(torch.tensor(selected_patch_indices_relative_b + (1 if self.exclude_cls else 0), device=device, dtype=torch.long))
+            
+            removed_patch_indices_relative_b = np.array([idx for idx in patch_indices_relative if idx not in selected_patch_indices_relative_b])
+            removed_token_indices_list.append(torch.tensor(removed_patch_indices_relative_b + (1 if self.exclude_cls else 0), device=device, dtype=torch.long))
+
+    
         mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
         if self.exclude_cls:
             mask[:, :, :, 0] = 1.0
             mask[:, :, 0, :] = 1.0
-            token_indices = selected_indices
             for b in range(B):
-                mask[b, :, :, token_indices[b]] = 1.0
-                mask[b, :, token_indices[b], :] = 1.0
+                mask[b, :, :, kept_token_indices_list[b]] = 1.0
+                mask[b, :, kept_token_indices_list[b], :] = 1.0
         else:
             for b in range(B):
-                mask[b, :, :, selected_indices[b]] = 1.0
-                mask[b, :, selected_indices[b], :] = 1.0
+                mask[b, :, :, kept_token_indices_list[b]] = 1.0
+                mask[b, :, kept_token_indices_list[b], :] = 1.0
         
         pruned_attn = attn_probs * mask
         pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
         context = torch.matmul(self.attn_drop(pruned_attn), v)
-        return context, None # No score delta for random pruning
+        return context, None, kept_token_indices_list, removed_token_indices_list # No score delta for random pruning
 
     def ucb_score_pruning(self, attn_scores, attn_probs, v, iteration, count_score_buffer):
         """
         Applies UCB-based patch pruning on attention probabilities.
+        Returns context, score_delta, and the indices of kept and removed tokens.
         """
-        B, H, N, _ = attn_scores.shape
+        B, H, N, D = v.shape # D is head_dim
         device = v.device
-        k = self._get_k(N)
+        
+        k_patches_to_keep = self._get_k(N)
 
-        if k >= (N - 1 if self.exclude_cls else N):
-            return torch.matmul(self.attn_drop(attn_probs), v), None
+        # Handle cases where no pruning or full pruning happens
+        if k_patches_to_keep >= (N - 1 if self.exclude_cls else N):
+            # Keep all patches (excluding CLS if specified)
+            kept_token_indices_list = [torch.arange(1, N, device=device, dtype=torch.long) for _ in range(B)] if self.exclude_cls else [torch.arange(N, device=device, dtype=torch.long) for _ in range(B)]
+            removed_token_indices_list = [torch.tensor([], device=device, dtype=torch.long) for _ in range(B)]
+            return torch.matmul(self.attn_drop(attn_probs), v), None, kept_token_indices_list, removed_token_indices_list
 
-        if k == 0 and self.exclude_cls:
+        if k_patches_to_keep == 0 and self.exclude_cls:
+            # Keep only CLS token
+            kept_token_indices_list = [torch.tensor([], device=device, dtype=torch.long) for _ in range(B)]
+            removed_token_indices_list = [torch.arange(1, N, device=device, dtype=torch.long) for _ in range(B)]
+
             mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
             mask[:, :, :, 0] = 1.0
             mask[:, :, 0, :] = 1.0
@@ -98,11 +126,13 @@ class UCBAttention(nn.Module):
             context = torch.matmul(pruned_attn, v)
             
             score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
-            score_delta[:, 0] += 1.0
-            return context, score_delta
+            score_delta[:, 0] += 1.0 # Only CLS is implicitly "kept" for score purposes
+            return context, score_delta, kept_token_indices_list, removed_token_indices_list
 
+        # --- UCB score calculation to identify patches to keep ---
         if self.exclude_cls:
-            patch_scores = attn_probs[:, :, :, 1:].mean(dim=2)
+            # We are working with patch tokens only for UCB selection
+            patch_scores = attn_probs[:, :, :, 1:].mean(dim=2) # Scores for non-CLS tokens
             relevant_counts = count_score_buffer[:, 1:]
         else:
             patch_scores = attn_probs.mean(dim=2)
@@ -113,40 +143,57 @@ class UCBAttention(nn.Module):
         )
 
         ucb_scores = patch_scores + ucb_exploration.unsqueeze(0)
-        global_ucb_scores = ucb_scores.mean(dim=1)
-        _, selected_indices = torch.topk(global_ucb_scores, k=k, dim=-1)
-
-        mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
+        global_ucb_scores = ucb_scores.mean(dim=1) # Average across heads
         
+        # Get indices of top-k patches (0-indexed relative to patches)
+        _, top_k_patch_indices_relative = torch.topk(global_ucb_scores, k=k_patches_to_keep, dim=-1)
+
+        # --- Determine full token indices (including CLS if present) ---
+        all_patch_indices_relative = torch.arange(N - (1 if self.exclude_cls else 0), device=device, dtype=torch.long)
+
+        kept_token_indices_list = []
+        removed_token_indices_list = []
+        for b in range(B):
+            kept_indices_b_relative_to_patches = top_k_patch_indices_relative[b]
+            kept_token_indices_list.append(kept_indices_b_relative_to_patches + (1 if self.exclude_cls else 0))
+
+            removed_indices_b_relative_to_patches = torch.tensor(
+                [idx for idx in all_patch_indices_relative if idx not in kept_indices_b_relative_to_patches],
+                device=device, dtype=torch.long
+            )
+            removed_token_indices_list.append(removed_indices_b_relative_to_patches + (1 if self.exclude_cls else 0))
+        
+        # Now, compute context using original attention masking, no actual token removal yet
+        # This ensures residual connection works within UCBEncoderBlock
+        mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
         if self.exclude_cls:
-            mask[:, :, :, 0] = 1.0
-            mask[:, :, 0, :] = 1.0
-            token_indices = selected_indices + 1
+            mask[:, :, :, 0] = 1.0 # CLS token can attend to all
+            mask[:, :, 0, :] = 1.0 # All tokens can attend to CLS
             for b in range(B):
-                mask[b, :, :, token_indices[b]] = 1.0
-                mask[b, :, token_indices[b], :] = 1.0
+                # Mask connections for kept tokens
+                mask[b, :, :, kept_token_indices_list[b]] = 1.0
+                mask[b, :, kept_token_indices_list[b], :] = 1.0
         else:
             for b in range(B):
-                mask[b, :, :, selected_indices[b]] = 1.0
-                mask[b, :, selected_indices[b], :] = 1.0
+                # Mask connections for kept tokens
+                mask[b, :, :, kept_token_indices_list[b]] = 1.0
+                mask[b, :, kept_token_indices_list[b], :] = 1.0
 
         pruned_attn = attn_probs * mask
+        # Normalize after masking, avoiding division by zero with small epsilon
         pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
         pruned_attn = self.attn_drop(pruned_attn)
-        context = torch.matmul(pruned_attn, v)
-        
-        score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
-        
-        if self.exclude_cls:
-            for b in range(B):
-                indices_to_update = (selected_indices[b] + 1).long()
-                score_delta[:, indices_to_update] += 1.0 / B
-        else:
-            for b in range(B):
-                indices_to_update = selected_indices[b].long()
-                score_delta[:, indices_to_update] += 1.0 / B
+        context = torch.matmul(pruned_attn, v) # B, H, N, D (N is original)
 
-        return context, score_delta
+        # Adjust score_delta calculation (still counts which patches were selected)
+        score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
+        for b in range(B):
+            # We need to update original 0-indexed patch indices for the buffer
+            # This will be the indices relative to the full sequence (including CLS)
+            indices_to_update = top_k_patch_indices_relative[b] + (1 if self.exclude_cls else 0)
+            score_delta[:, indices_to_update] += 1.0 / B
+
+        return context, score_delta, kept_token_indices_list, removed_token_indices_list
     
     def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode='ucb'):
         B, N, C = x.shape
@@ -157,23 +204,32 @@ class UCBAttention(nn.Module):
         attn_probs = attn_scores.softmax(dim=-1)
 
         score_delta = None
+        kept_token_indices_list = [torch.arange(N, device=x.device, dtype=torch.long) for _ in range(B)] # Default to keeping all
+        removed_token_indices_list = [torch.tensor([], device=x.device, dtype=torch.long) for _ in range(B)] # Default to removing none
+
         if pruning_enabled and counter > 50: # Warm-up period
             if selection_mode == 'ucb':
-                context, score_delta = self.ucb_score_pruning(
+                context, score_delta, kept_token_indices_list, removed_token_indices_list = self.ucb_score_pruning(
                     attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
                 )
             elif selection_mode == 'random':
-                context, score_delta = self.random_pruning(attn_probs, v)
+                context, score_delta, kept_token_indices_list, removed_token_indices_list = self.random_pruning(attn_probs, v)
             else:
                 raise ValueError(f"Unknown selection mode: {selection_mode}")
         else:
             attn_probs = self.attn_drop(attn_probs)
             context = torch.matmul(attn_probs, v)
+            # If pruning is not enabled, all non-CLS tokens are "kept" in terms of selection
+            if self.exclude_cls:
+                kept_token_indices_list = [torch.arange(1, N, device=x.device, dtype=torch.long) for _ in range(B)]
+            else:
+                kept_token_indices_list = [torch.arange(N, device=x.device, dtype=torch.long) for _ in range(B)]
+
 
         x = context.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x, score_delta
+        return x, score_delta, kept_token_indices_list, removed_token_indices_list
 
 class UCBEncoderBlock(nn.Module):
     def __init__(self, original_block: nn.Module, **ucb_kwargs):
@@ -201,10 +257,46 @@ class UCBEncoderBlock(nn.Module):
         self.attn.load_state_dict(state_dict, strict=False)
 
     def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode):
-        h, score_delta = self.attn(self.norm1(x), counter, pruning_enabled, ucb_count_score, selection_mode)
-        x = x + self.drop_path1(self.ls1(h))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        return x, score_delta
+        B, N_original, C = x.shape
+        # Attention block
+        h_attn, score_delta, kept_token_indices_list, removed_token_indices_list = self.attn(
+            self.norm1(x), counter, pruning_enabled, ucb_count_score, selection_mode
+        )
+        # Apply first residual connection
+        x_after_attn = x + self.drop_path1(self.ls1(h_attn.transpose(1, 2).reshape(B, N_original, C)))
+
+        # --- Token merging/selection ---
+        x_new_sequence = []
+        for b in range(B):
+            current_batch_tokens = []
+            
+            # 1. Add CLS token if exclude_cls is True (it's always index 0)
+            if self.attn.exclude_cls:
+                current_batch_tokens.append(x_after_attn[b, 0:1, :]) # (1, C)
+            
+            # 2. Add kept tokens
+            kept_indices_b = kept_token_indices_list[b]
+            if len(kept_indices_b) > 0:
+                # Ensure kept_indices_b are 1D for index_select
+                kept_tokens = torch.index_select(x_after_attn[b], dim=0, index=kept_indices_b) # (num_kept, C)
+                current_batch_tokens.append(kept_tokens)
+            
+            # 3. Compute and add merged token from removed tokens
+            removed_indices_b = removed_token_indices_list[b]
+            if len(removed_indices_b) > 0:
+                removed_tokens = torch.index_select(x_after_attn[b], dim=0, index=removed_indices_b) # (num_removed, C)
+                merged_token = removed_tokens.mean(dim=0, keepdim=True) # (1, C)
+                current_batch_tokens.append(merged_token)
+            
+            # Concatenate all tokens for this batch item
+            x_new_sequence.append(torch.cat(current_batch_tokens, dim=0)) # (N_new, C)
+        
+        # Stack all batch items to form (B, N_new, C)
+        x_new = torch.stack(x_new_sequence, dim=0)
+
+        # MLP block (applied to the new, potentially shorter sequence)
+        x_final = x_new + self.drop_path2(self.ls2(self.mlp(self.norm2(x_new))))
+        return x_final, score_delta
 
 class VisionTransformerUCB(nn.Module):
     def __init__(self, model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=None,
