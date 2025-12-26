@@ -195,7 +195,7 @@ class UCBAttention(nn.Module):
 
         return context, score_delta, kept_token_indices_list, removed_token_indices_list
     
-    def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode='ucb'):
+    def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode='ucb', ucb_update_enabled=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -209,9 +209,13 @@ class UCBAttention(nn.Module):
 
         if pruning_enabled and counter > 50: # Warm-up period
             if selection_mode == 'ucb':
-                context, score_delta, kept_token_indices_list, removed_token_indices_list = self.ucb_score_pruning(
+                context, score_delta_tmp, kept_token_indices_list, removed_token_indices_list = self.ucb_score_pruning(
                     attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
                 )
+                if ucb_update_enabled: # Only propagate score_delta if flag is True
+                    score_delta = score_delta_tmp
+                else:
+                    score_delta = None # Do not update UCB scores
             elif selection_mode == 'random':
                 context, score_delta, kept_token_indices_list, removed_token_indices_list = self.random_pruning(attn_probs, v)
             else:
@@ -256,11 +260,11 @@ class UCBEncoderBlock(nn.Module):
         state_dict = orig_attn.state_dict()
         self.attn.load_state_dict(state_dict, strict=False)
 
-    def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode):
+    def forward(self, x, counter, pruning_enabled, ucb_count_score, selection_mode, ucb_update_enabled=False):
         B, N_original, C = x.shape
         # Attention block
         h_attn, score_delta, kept_token_indices_list, removed_token_indices_list = self.attn(
-            self.norm1(x), counter, pruning_enabled, ucb_count_score, selection_mode
+            self.norm1(x), counter, pruning_enabled, ucb_count_score, selection_mode, ucb_update_enabled
         )
         # Apply first residual connection
         x_after_attn = x + self.drop_path1(self.ls1(h_attn.transpose(1, 2).reshape(B, N_original, C)))
@@ -330,18 +334,28 @@ class VisionTransformerUCB(nn.Module):
         ])
 
         num_layers = len(self.blocks)
-        num_heads = self.blocks[0].attn.num_heads
-        num_patches = self.pos_embed.shape[1]
+        # Check if blocks list is not empty to safely access self.blocks[0]
+        if num_layers > 0:
+            num_heads = self.blocks[0].attn.num_heads
+        else:
+            # Fallback if no blocks are created (e.g., in a very simplified test case)
+            num_heads = 1 # Default or a sensible fallback
+        
+        # Determine num_patches based on pos_embed shape
+        # pos_embed shape is (1, num_patches_with_cls_token, embed_dim)
+        num_patches_with_cls_token = self.pos_embed.shape[1]
 
-        self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches))
+        self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches_with_cls_token))
 
-    def forward(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None, top_k_indices: torch.Tensor = None):
+    def forward(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None, top_k_indices: torch.Tensor = None, ucb_update_enabled: bool = False):
         if top_k_indices is not None:
+             # This path is for static pruning (token dropping), which user clarified is not desired for new pipeline.
+             # However, it remains for compatibility if it's used elsewhere.
              return self.forward_pruned(pixel_values, top_k_indices, labels)
         else:
-             return self.forward_dynamic(pixel_values, counter, pruning_enabled, labels)
+             return self.forward_dynamic(pixel_values, counter, pruning_enabled, labels, ucb_update_enabled)
 
-    def forward_dynamic(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None):
+    def forward_dynamic(self, pixel_values: torch.Tensor, counter: int = 0, pruning_enabled: bool = True, labels: torch.Tensor = None, ucb_update_enabled: bool = False):
         x = pixel_values
         x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
@@ -354,10 +368,12 @@ class VisionTransformerUCB(nn.Module):
                 counter=counter, 
                 pruning_enabled=pruning_enabled,
                 ucb_count_score=self.ucb_count_scores[i],
-                selection_mode=self.selection_mode
+                selection_mode=self.selection_mode,
+                ucb_update_enabled=ucb_update_enabled # Pass the new flag
             )
             
             if score_delta is not None and self.selection_mode == 'ucb':
+                # Update ucb_count_scores only if score_delta is propagated (ucb_update_enabled was True)
                 self.ucb_count_scores[i].data += score_delta.data
 
         x = self.norm(x)
@@ -401,10 +417,11 @@ class VisionTransformerUCB(nn.Module):
         for i, block in enumerate(self.blocks):
             x, _ = block(
                 x, 
-                counter=99999,
+                counter=99999, # High counter to ensure no warm-up
                 pruning_enabled=False,
-                ucb_count_score=None,
-                selection_mode=self.selection_mode
+                ucb_count_score=None, # Not used in this path
+                selection_mode=self.selection_mode,
+                ucb_update_enabled=False # No UCB score update
             )
             
         x = self.norm(x)

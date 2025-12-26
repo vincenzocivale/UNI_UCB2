@@ -16,10 +16,11 @@ def compute_metrics(p: EvalPrediction):
     }
 
 class UcbTrainer(Trainer):
-    def __init__(self, *args, top_k_indices=None, pruning_enabled=True, **kwargs):
+    def __init__(self, *args, top_k_indices=None, pruning_enabled=True, ucb_update_enabled=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.top_k_indices = top_k_indices
         self.pruning_enabled = pruning_enabled
+        self.ucb_update_enabled = ucb_update_enabled
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -32,7 +33,8 @@ class UcbTrainer(Trainer):
             counter=self.state.global_step,
             pruning_enabled=self.pruning_enabled,
             top_k_indices=self.top_k_indices,
-            labels=labels
+            labels=labels,
+            ucb_update_enabled=self.ucb_update_enabled # Pass the new flag
         )
 
         if labels is not None:
