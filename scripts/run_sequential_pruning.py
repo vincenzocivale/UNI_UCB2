@@ -179,11 +179,11 @@ if __name__ == "__main__":
     # --- Arguments from run_pruning_finetune.py ---
     parser.add_argument("--data_dir", type=str, default="/data/patches/", help="Directory with H5 patch files.")
     parser.add_argument("--output_dir", type=str, default="./results/sequential_pruning_merge", help="Base directory to save checkpoints and results.")
-    parser.add_argument("--run_name", type=str, default="vit-merge-sequential", help="Base name for the WandB run.")
+    parser.add_argument("--run_name", type=str, default="vit-pruning-merging", help="Base name for the WandB run.")
     parser.add_argument("--img_size", type=int, default=224, help="Image size.")
     parser.add_argument("--batch_size", type=int, default=12, help="Batch size for training and evaluation.")
     parser.add_argument("--num_epochs", type=int, default=30, help="Number of epochs for each stage.")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate.")
+    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--model_name", type=str, default="hf-hub:MahmoodLab/uni", help="Name of the pretrained model from timm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--use_wandb", action='store_true', help="Flag to enable WandB logging.")
