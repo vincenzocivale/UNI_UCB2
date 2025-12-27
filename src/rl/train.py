@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from tqdm.auto import tqdm
 from typing import Optional, Dict, Tuple, List, Union
 from sklearn.metrics import f1_score
+from src.models.vit.pruning import get_global_pruning_indices
+from src.training.phases import TrainingPhase
 
-# --- Configurazione del Logging ---
+# --- Logging Configuration ---
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     datefmt="%m/%d/%Y %H:%M:%S",
@@ -23,7 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Integrazione con Weights & Biases (W&B) ---
+# --- Weights & Biases (W&B) Integration ---
 try:
     import wandb
     _WANDB_AVAILABLE = True
@@ -32,7 +34,7 @@ except ImportError:
 
 @dataclass
 class TrainingArguments:
-    """Argomenti che definiscono il processo di training."""
+    """Arguments defining the training process."""
     output_dir: str
     run_name: str = "vit-pruning-run"
     num_train_epochs: float = 3.0
@@ -59,7 +61,7 @@ class TrainingArguments:
     save_best_model: bool = True
     # New parameter to specify model type
     model_type: str = "ucb"  # "ucb", "random", or "baseline"
-    freeze_backbone: bool = False # Nuovo argomento per congelare il backbone
+    freeze_backbone: bool = False # New argument to freeze the backbone
     input_aware_extra_tokens: int = 0
 
 class ModelTrainer:
@@ -88,7 +90,7 @@ class ModelTrainer:
         
         logger.info(f"Detected/Using model type: {self.model_type}")
 
-        # Calcola il numero totale di passi di training
+        # Calculate total number of training steps
         num_update_steps_per_epoch = len(self.train_dataloader) // self.args.gradient_accumulation_steps
         if self.args.max_steps <= 0:
             self.args.max_steps = int(self.args.num_train_epochs * num_update_steps_per_epoch)
@@ -99,14 +101,14 @@ class ModelTrainer:
         self.model.to(self.device)
 
 
-        # Inizializza optimizer e scheduler
+        # Initialize optimizer and scheduler
         optimizer, scheduler = optimizers
         self.optimizer = optimizer if optimizer is not None else self.create_optimizer()
         self.scheduler = scheduler if scheduler is not None else self.create_scheduler()
 
         self.scaler = GradScaler(enabled=self.args.fp16)
         
-        # Inizializza W&B se richiesto
+        # Initialize W&B if requested
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
             # Add model type to wandb config
             config = vars(self.args).copy()
@@ -115,16 +117,16 @@ class ModelTrainer:
             wandb.init(project="vit-ucb-pruning3", name=self.args.run_name, config=config)
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
-        # Gestione dei checkpoint
+        # Checkpoint management
         self._checkpoints = [] if self.args.save_total_limit is not None and self.args.save_total_limit > 0 else None
 
-        # Inizializzazione per l'early stopping
+        # Early stopping initialization
         self.patience_counter = 0
         self.metric_greater_is_better = "loss" not in self.args.early_stopping_metric
         self.best_metric = None
         if self.args.early_stopping_patience > 0 or self.args.save_best_model:
             self.best_metric = float('-inf') if self.metric_greater_is_better else float('inf')
-            logger.info(f"Monitoraggio della metrica '{self.args.early_stopping_metric}' per early stopping e/o salvataggio del modello migliore.")
+            logger.info(f"Monitoring metric '{self.args.early_stopping_metric}' for early stopping and/or best model saving.")
 
     def _detect_model_type(self) -> str:
         """Automatically detect the model type based on available attributes."""
@@ -149,7 +151,7 @@ class ModelTrainer:
         return LambdaLR(self.optimizer, lr_lambda)
 
     def train(self, pruning_logging: bool = True):
-        logger.info("***** Inizio del Training *****")
+        logger.info("***** Starting Training *****")
         logger.info(f"  Num Epochs = {self.args.num_train_epochs}")
         logger.info(f"  Total optimization steps = {self.args.max_steps}")
         logger.info(f"  Model type = {self.model_type}")
@@ -160,12 +162,12 @@ class ModelTrainer:
 
         best_model_path = None
         
-        # Ciclo di training principale
+        # Main training loop
         for epoch in range(int(math.ceil(self.args.num_train_epochs))):
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{int(self.args.num_train_epochs)}", leave=False)
             
             for step, batch in enumerate(progress_bar):
-                # FIX: Passa global_step come counter (era mancante!)
+                # Pass global_step as counter
                 loss = self._training_step(batch, counter=global_step)
                 train_loss += loss.item()
 
@@ -177,7 +179,7 @@ class ModelTrainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     
-                    # DEBUG: Aggiungi log per verificare global_step
+                    # Log global_step for debugging
                     if global_step % 100 == 0:
                         logger.info(f"[DEBUG TRAIN] Global step: {global_step}")
                     
@@ -190,14 +192,14 @@ class ModelTrainer:
                         metrics_to_log = {
                             "train/loss": train_loss / self.args.logging_steps,
                             "train/learning_rate": self.scheduler.get_last_lr()[0],
-                            "train/global_step": global_step  # Aggiungi per debug
+                            "train/global_step": global_step  # Add for debugging
                         }
                         if pruning_logging:
                             self._log_pruning_metrics(metrics_to_log)
                         self._log(metrics_to_log, step=global_step)
                         train_loss = 0.0
 
-                    # Valutazione
+                    # Evaluation
                     if self.args.evaluation_strategy == "steps" and global_step % self.args.eval_steps == 0:
                         metrics = self.evaluate(counter=global_step)
                         if self.args.save_best_model and self._check_for_improvement(metrics):
@@ -207,11 +209,11 @@ class ModelTrainer:
                         self._log(metrics, step=global_step)
                         
                         if self._check_early_stopping():
-                            logger.info("Early stopping attivato. Interruzione del training.")
+                            logger.info("Early stopping triggered. Stopping training.")
                             self.finalize_training(global_step, best_model_path=best_model_path)
                             return
 
-                    # Salvataggio del checkpoint
+                    # Save checkpoint
                     if self.args.save_strategy == "steps" and global_step % self.args.save_steps == 0:
                         self._save_checkpoint(global_step)
 
@@ -219,7 +221,7 @@ class ModelTrainer:
                 metrics = self.evaluate(counter=global_step)
                 self._log(metrics, step=global_step)
                 if self._check_early_stopping():
-                    logger.info("Early stopping attivato. Interruzione del training.")
+                    logger.info("Early stopping triggered. Stopping training.")
                     self.finalize_training(global_step, best_model_path=best_model_path)
                     return
             
@@ -230,19 +232,19 @@ class ModelTrainer:
 
 
     def finalize_training(self, global_step: int, best_model_path: Optional[str] = None):
-        """Esegue i passaggi finali dopo il completamento del training."""
-        logger.info("Training terminato. Esecuzione della valutazione finale.")
+        """Executes final steps after training completion."""
+        logger.info("Training completed. Performing final evaluation.")
         
         # Load the best model if it exists
         if best_model_path and os.path.exists(best_model_path):
-            logger.info(f"Caricamento del modello migliore da {best_model_path} per la valutazione finale.")
+            logger.info(f"Loading best model from {best_model_path} for final evaluation.")
             self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         
         metrics, val_preds, val_labels = self.evaluate(counter=global_step, return_preds=True)
         self._log(metrics, step=global_step)
 
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
-            logger.info("Logging della confusion matrix del set di validazione su W&B.")
+            logger.info("Logging validation set confusion matrix to W&B.")
             self._log_confusion_matrix("val", val_preds, val_labels, step=global_step)
 
         if self.test_dataloader is not None:
@@ -259,29 +261,36 @@ class ModelTrainer:
         
         with autocast(enabled=self.args.fp16):
             # Universal forward pass handling
-            output = self._forward_pass(inputs, labels, counter, training=True)
+            output = self._forward_pass(inputs, labels, counter, phase=TrainingPhase.UCB_ESTIMATION)
             loss = output[0] if isinstance(output, tuple) else output
 
         scaled_loss = self.scaler.scale(loss / self.args.gradient_accumulation_steps)
         scaled_loss.backward()
         return loss.detach()
 
-    def _forward_pass(self, inputs: torch.Tensor, labels: Optional[torch.Tensor], counter: int, training: bool = True):
-        """Universal forward pass that works with all model types."""
+    def _forward_pass(self, inputs: torch.Tensor, labels: Optional[torch.Tensor], counter: int, phase: TrainingPhase):
+        """Universal forward pass that works with all model types, explicitly controlled by TrainingPhase."""
         if self.model_type == "ucb":
             keep_ratio = getattr(self.model, 'keep_ratio', 1.0)
             
-            if training:
-                # Training: usa UCB per esplorare e selezionare dinamicamente le patch
-                # poi applica pruning fisico
+            if phase == TrainingPhase.UCB_ESTIMATION:
+                # Phase 1: UCB estimation - UCB counts are updated, but no physical pruning is applied *here*.
+                # The model's internal attention will apply logical pruning based on UCB scores.
                 return self.model(x=inputs, labels=labels, counter=counter, ucb_enabled=True)
-            else:
-                # Validation: pruning deterministico con top-k patches apprese
+            elif phase == TrainingPhase.PRUNING_INFERENCE:
+                # Phase 2: Pruning / Inference - Physical pruning with top-k patches learned from UCB.
+                # UCB counts are NOT updated.
                 with torch.no_grad():
                     if keep_ratio < 1.0:
-                        top_k_indices = self.model.get_top_k_patch_indices(keep_ratio=keep_ratio)
+                        top_k_indices = get_global_pruning_indices(
+                            ucb_count_scores=self.model.ucb_count_scores,
+                            pos_embed_shape=self.model.pos_embed.shape,
+                            keep_ratio=keep_ratio
+                        )
                         logits = self.model.forward_pruned(inputs, top_k_indices.to(self.device))
                     else:
+                        # If keep_ratio is 1.0 (no pruning), run the model normally in eval mode.
+                        # UCB should be disabled as we are not learning or updating counts.
                         output = self.model(x=inputs, labels=None, ucb_enabled=False)
                         logits = output.logits if hasattr(output, 'logits') else output
 
@@ -292,7 +301,10 @@ class ModelTrainer:
                     return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
         
         elif self.model_type == "random":
-            return self.model(x=inputs, labels=labels, counter=counter, random_enabled=training)
+            # For random model, `random_enabled=True` during training for dynamic random pruning,
+            # `random_enabled=False` during inference for deterministic random pruning.
+            random_enabled = (phase == TrainingPhase.UCB_ESTIMATION) # Re-using the phase for random_enabled
+            return self.model(x=inputs, labels=labels, counter=counter, random_enabled=random_enabled)
         else: # Baseline
             output = self.model(inputs)
             logits = output.logits if hasattr(output, 'logits') else output
@@ -303,18 +315,18 @@ class ModelTrainer:
             return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
 
     def evaluate(self, counter: int, return_preds: bool = False) -> Union[Dict[str, float], Tuple[Dict[str, float], list, list]]:
-        print(f"***** Esecuzione Valutazione allo Step {counter} *****")
+        logger.info(f"***** Running Evaluation at Step {counter} *****")
         self.model.eval()
 
         total_loss, total_correct, total_samples = 0, 0, 0
         all_preds, all_labels = [], []
 
-        for batch in tqdm(self.eval_dataloader, desc="Valutazione", leave=False):
+        for batch in tqdm(self.eval_dataloader, desc="Evaluation", leave=False):
             inputs, labels = batch
             inputs, labels = inputs.to(self.device), labels.to(self.device)
 
             with torch.no_grad(), autocast(enabled=self.args.fp16):
-                output = self._forward_pass(inputs, labels, counter, training=False)
+                output = self._forward_pass(inputs, labels, counter, phase=TrainingPhase.PRUNING_INFERENCE)
                 loss, logits = output if isinstance(output, tuple) else (torch.tensor(0.0), output)
             
             total_loss += loss.item() * inputs.size(0)
@@ -333,26 +345,26 @@ class ModelTrainer:
         f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
         metrics = {"eval/loss": avg_loss, "eval/accuracy": accuracy, "eval/f1": f1}
-        logger.info(f"  Risultati valutazione: {metrics}")
+        logger.info(f"  Evaluation results: {metrics}")
         
         self.model.train()
         return (metrics, all_preds, all_labels) if return_preds else metrics
     
     def predict(self, step: Optional[int] = None):
         if self.test_dataloader is None:
-            logger.warning("Test dataloader non fornito. Salto della predizione sul test set.")
+            logger.warning("Test dataloader not provided. Skipping prediction on test set.")
             return
 
-        logger.info("***** Esecuzione Predizione sul Test Set *****")
+        logger.info("***** Running Prediction on Test Set *****")
         self.model.eval()
 
         all_preds, all_labels = [], []
-        for batch in tqdm(self.test_dataloader, desc="Predizione", leave=False):
+        for batch in tqdm(self.test_dataloader, desc="Prediction", leave=False):
             inputs, labels = batch
             inputs, labels = inputs.to(self.device), labels.to(self.device)
 
             with torch.no_grad(), autocast(enabled=self.args.fp16):
-                output = self._forward_pass(inputs, None, counter=99999, training=False)
+                output = self._forward_pass(inputs, None, counter=99999, phase=TrainingPhase.PRUNING_INFERENCE)
                 logits = output[1] if isinstance(output, tuple) and len(output) > 1 else output
 
             preds = torch.argmax(logits, dim=-1)
@@ -367,7 +379,7 @@ class ModelTrainer:
 
         metrics = {"test/accuracy": accuracy, "test/f1": f1}
         self._log(metrics, step=step)
-        logger.info(f"  Risultati test set: {metrics}")
+        logger.info(f"  Test set results: {metrics}")
         
         self.model.train()
     
@@ -382,17 +394,17 @@ class ModelTrainer:
     def _log_ucb_metrics(self, metrics_dict: Dict):
         """Log UCB-specific metrics."""
         with torch.no_grad():
-            ucb_scores = self.model.ucb_count_scores.detach().float()
+            ucb_counts = self.model.ucb_count_scores.detach().float()
             metrics_dict.update({
-                "pruning/ucb_sparsity": (ucb_scores == 0).sum().item() / ucb_scores.numel(),
-                "pruning/ucb_mean_selection_count": ucb_scores.mean().item(),
-                "pruning/ucb_max_selection_count": ucb_scores.max().item(),
-                "pruning/ucb_min_selection_count": ucb_scores.min().item(),
-                "pruning/ucb_selection_std": ucb_scores.std().item(),
+                "pruning/ucb_sparsity": (ucb_counts == 0).sum().item() / ucb_counts.numel(),
+                "pruning/ucb_mean_selection_count": ucb_counts.mean().item(),
+                "pruning/ucb_max_selection_count": ucb_counts.max().item(),
+                "pruning/ucb_min_selection_count": ucb_counts.min().item(),
+                "pruning/ucb_selection_std": ucb_counts.std().item(),
             })
             
             if _WANDB_AVAILABLE:
-                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_scores.cpu().numpy())
+                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_counts.cpu().numpy())
 
     def _log_random_metrics(self, metrics_dict: Dict):
         """Log Random pruning-specific metrics."""
@@ -402,12 +414,12 @@ class ModelTrainer:
             metrics_dict.update({
                 "pruning/method": "random",
                 "pruning/random_seed": stats.get('random_seed', 'unknown'),
-                "pruning/total_patches": stats.get('total_patches', 0),
+                "pruning/total_tokens": stats.get('total_tokens', 0),
             })
             
             # Log keep ratios for each layer
             for key, value in stats.items():
-                if 'keep_ratio' in key or 'kept_patches' in key:
+                if 'keep_ratio' in key or 'kept_tokens' in key:
                     metrics_dict[f"pruning/{key}"] = value
 
     def _log(self, metrics: Dict[str, float], step: Optional[int] = None):
@@ -436,19 +448,19 @@ class ModelTrainer:
         os.makedirs(output_path, exist_ok=True)
         ckpt_path = os.path.join(output_path, f"{self.args.run_name}.bin")
         
-        logger.info(f"Salvataggio del checkpoint del modello in {output_path}")
+        logger.info(f"Saving model checkpoint to {output_path}")
         torch.save(self.model.state_dict(), ckpt_path)
         
-        # Gestisce il limite di checkpoint da salvare (LOGICA CORRETTA)
+        # Manages the limit of checkpoints to save (CORRECT LOGIC)
         if self._checkpoints is not None and not is_best and not final:
             self._checkpoints.append(output_path)
             if len(self._checkpoints) > self.args.save_total_limit:
-                oldest_ckpt = self._checkpoints.pop(0) # Rimuovi il più vecchio (il primo della lista)
+                oldest_ckpt = self._checkpoints.pop(0) # Remove the oldest (first in the list)
                 if os.path.exists(oldest_ckpt):
-                    logger.info(f"Rimozione del vecchio checkpoint: {oldest_ckpt}")
+                    logger.info(f"Removing old checkpoint: {oldest_ckpt}")
                     shutil.rmtree(oldest_ckpt)
                 else:
-                    logger.warning(f"Il vecchio checkpoint non è stato trovato a: {oldest_ckpt}, impossibile rimuoverlo.")
+                    logger.warning(f"Old checkpoint not found at: {oldest_ckpt}, unable to remove.")
             
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
             aliases = []
@@ -462,7 +474,7 @@ class ModelTrainer:
             artifact = wandb.Artifact(name=f"{self.args.run_name}", type="model", metadata={"step": name, "model_type": self.model_type})
             artifact.add_file(path)
             wandb.log_artifact(artifact, aliases=aliases)
-            logger.info(f"Checkpoint '{name}' caricato su W&B con alias: {aliases}.")
+            logger.info(f"Checkpoint '{name}' uploaded to W&B with aliases: {aliases}.")
 
     def _check_for_improvement(self, metrics: Dict[str, float]) -> bool:
         """Check if the monitored metric has improved."""
@@ -474,11 +486,256 @@ class ModelTrainer:
         if improvement > self.args.early_stopping_threshold:
             self.best_metric = metric_value
             self.patience_counter = 0
-            logger.info(f"Nuova metrica migliore trovata: {self.args.early_stopping_metric} = {metric_value:.4f}. Reset della pazienza.")
+            logger.info(f"New best metric found: {self.args.early_stopping_metric} = {metric_value:.4f}. Resetting patience counter.")
             return True
         else:
             self.patience_counter += 1
-            logger.info(f"Nessun miglioramento. Contatore pazienza: {self.patience_counter}/{self.args.early_stopping_patience}.")
+            logger.info(f"No improvement. Patience counter: {self.patience_counter}/{self.args.early_stopping_patience}.")
+            return False
+
+    def _check_early_stopping(self) -> bool:
+        """Check if early stopping condition is met."""
+        if self.args.early_stopping_patience <= 0:
+            return False
+        return self.patience_counter >= self.args.early_stopping_patience
+
+    def _training_step(self, batch: tuple, counter: int) -> torch.Tensor:
+        self.model.train()
+        inputs, labels = batch
+        inputs, labels = inputs.to(self.device), labels.to(self.device)
+        
+        with autocast(enabled=self.args.fp16):
+            # Universal forward pass handling
+            output = self._forward_pass(inputs, labels, counter, phase=TrainingPhase.UCB_ESTIMATION)
+            loss = output[0] if isinstance(output, tuple) else output
+
+        scaled_loss = self.scaler.scale(loss / self.args.gradient_accumulation_steps)
+        scaled_loss.backward()
+        return loss.detach()
+
+    def _forward_pass(self, inputs: torch.Tensor, labels: Optional[torch.Tensor], counter: int, phase: TrainingPhase):
+        """Universal forward pass that works with all model types, explicitly controlled by TrainingPhase."""
+        if self.model_type == "ucb":
+            keep_ratio = getattr(self.model, 'keep_ratio', 1.0)
+            
+            if phase == TrainingPhase.UCB_ESTIMATION:
+                # Phase 1: UCB estimation - UCB counts are updated, but no physical pruning is applied *here*.
+                # The model's internal attention will apply logical pruning based on UCB scores.
+                return self.model(x=inputs, labels=labels, counter=counter, ucb_enabled=True)
+            elif phase == TrainingPhase.PRUNING_INFERENCE:
+                # Phase 2: Pruning / Inference - Physical pruning with top-k patches learned from UCB.
+                # UCB counts are NOT updated.
+                with torch.no_grad():
+                    if keep_ratio < 1.0:
+                        top_k_indices = get_global_pruning_indices(
+                            ucb_count_scores=self.model.ucb_count_scores,
+                            pos_embed_shape=self.model.pos_embed.shape,
+                            keep_ratio=keep_ratio
+                        )
+                        logits = self.model.forward_pruned(inputs, top_k_indices.to(self.device))
+                    else:
+                        # If keep_ratio is 1.0 (no pruning), run the model normally in eval mode.
+                        # UCB should be disabled as we are not learning or updating counts.
+                        output = self.model(x=inputs, labels=None, ucb_enabled=False)
+                        logits = output.logits if hasattr(output, 'logits') else output
+
+                    loss = None
+                    if labels is not None:
+                        loss_fct = nn.CrossEntropyLoss()
+                        loss = loss_fct(logits, labels)
+                    return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
+        
+        elif self.model_type == "random":
+            # For random model, `random_enabled=True` during training for dynamic random pruning,
+            # `random_enabled=False` during inference for deterministic random pruning.
+            random_enabled = (phase == TrainingPhase.UCB_ESTIMATION) # Re-using the phase for random_enabled
+            return self.model(x=inputs, labels=labels, counter=counter, random_enabled=random_enabled)
+        else: # Baseline
+            output = self.model(inputs)
+            logits = output.logits if hasattr(output, 'logits') else output
+            loss = None
+            if labels is not None:
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits, labels)
+            return (loss, logits) if loss is not None else (torch.tensor(0.0), logits)
+
+    def evaluate(self, counter: int, return_preds: bool = False) -> Union[Dict[str, float], Tuple[Dict[str, float], list, list]]:
+        logger.info(f"***** Running Evaluation at Step {counter} *****")
+        self.model.eval()
+
+        total_loss, total_correct, total_samples = 0, 0, 0
+        all_preds, all_labels = [], []
+
+        for batch in tqdm(self.eval_dataloader, desc="Evaluation", leave=False):
+            inputs, labels = batch
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+            with torch.no_grad(), autocast(enabled=self.args.fp16):
+                output = self._forward_pass(inputs, labels, counter, phase=TrainingPhase.PRUNING_INFERENCE)
+                loss, logits = output if isinstance(output, tuple) else (torch.tensor(0.0), output)
+            
+            total_loss += loss.item() * inputs.size(0)
+            preds = torch.argmax(logits, dim=-1)
+            total_correct += (preds == labels).sum().item()
+            total_samples += inputs.size(0)
+
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+
+        all_preds = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        accuracy = total_correct / total_samples if total_samples > 0 else 0
+        f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+
+        metrics = {"eval/loss": avg_loss, "eval/accuracy": accuracy, "eval/f1": f1}
+        logger.info(f"  Evaluation results: {metrics}")
+        
+        self.model.train()
+        return (metrics, all_preds, all_labels) if return_preds else metrics
+    
+    def predict(self, step: Optional[int] = None):
+        if self.test_dataloader is None:
+            logger.warning("Test dataloader not provided. Skipping prediction on test set.")
+            return
+
+        logger.info("***** Running Prediction on Test Set *****")
+        self.model.eval()
+
+        all_preds, all_labels = [], []
+        for batch in tqdm(self.test_dataloader, desc="Prediction", leave=False):
+            inputs, labels = batch
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+            with torch.no_grad(), autocast(enabled=self.args.fp16):
+                output = self._forward_pass(inputs, None, counter=99999, phase=TrainingPhase.PRUNING_INFERENCE)
+                logits = output[1] if isinstance(output, tuple) and len(output) > 1 else output
+
+            preds = torch.argmax(logits, dim=-1)
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+
+        all_preds = torch.cat(all_preds).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+
+        accuracy = (all_preds == all_labels).sum() / all_labels.shape[0]
+        f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+
+        metrics = {"test/accuracy": accuracy, "test/f1": f1}
+        self._log(metrics, step=step)
+        logger.info(f"  Test set results: {metrics}")
+        
+        self.model.train()
+    
+    def _log_pruning_metrics(self, metrics_dict: Dict):
+        """Log metrics specific to the pruning method."""
+        if self.model_type == "ucb" and hasattr(self.model, 'ucb_count_scores'):
+            self._log_ucb_metrics(metrics_dict)
+        elif self.model_type == "random":
+            self._log_random_metrics(metrics_dict)
+        # For baseline models, no special metrics to log
+
+    def _log_ucb_metrics(self, metrics_dict: Dict):
+        """Log UCB-specific metrics."""
+        with torch.no_grad():
+            ucb_counts = self.model.ucb_count_scores.detach().float()
+            metrics_dict.update({
+                "pruning/ucb_sparsity": (ucb_counts == 0).sum().item() / ucb_counts.numel(),
+                "pruning/ucb_mean_selection_count": ucb_counts.mean().item(),
+                "pruning/ucb_max_selection_count": ucb_counts.max().item(),
+                "pruning/ucb_min_selection_count": ucb_counts.min().item(),
+                "pruning/ucb_selection_std": ucb_counts.std().item(),
+            })
+            
+            if _WANDB_AVAILABLE:
+                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_counts.cpu().numpy())
+
+    def _log_random_metrics(self, metrics_dict: Dict):
+        """Log Random pruning-specific metrics."""
+        # For random pruning, we can log the pruning configuration
+        if hasattr(self.model, 'get_pruning_stats'):
+            stats = self.model.get_pruning_stats()
+            metrics_dict.update({
+                "pruning/method": "random",
+                "pruning/random_seed": stats.get('random_seed', 'unknown'),
+                "pruning/total_tokens": stats.get('total_tokens', 0),
+            })
+            
+            # Log keep ratios for each layer
+            for key, value in stats.items():
+                if 'keep_ratio' in key or 'kept_tokens' in key:
+                    metrics_dict[f"pruning/{key}"] = value
+
+    def _log(self, metrics: Dict[str, float], step: Optional[int] = None):
+        """Log metrics to W&B."""
+        if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
+            wandb.log(metrics, step=step)
+    
+    def _log_confusion_matrix(self, prefix: str, preds: list, labels: list, step: Optional[int] = None):
+        """Log confusion matrix to W&B."""
+        if _WANDB_AVAILABLE:
+            wandb.log({
+                f"{prefix}/confusion_matrix": wandb.plot.confusion_matrix(
+                    preds=preds, y_true=labels, class_names=self.class_names
+                )
+            }, step=step)
+
+    def _save_checkpoint(self, step: int, final: bool = False, is_best: bool = False):
+        if is_best:
+            name = "best_model"
+        elif final:
+            name = "final_checkpoint"
+        else:
+            name = f"checkpoint-{step}"
+        
+        output_path = os.path.join(self.args.output_dir, name)
+        os.makedirs(output_path, exist_ok=True)
+        ckpt_path = os.path.join(output_path, f"{self.args.run_name}.bin")
+        
+        logger.info(f"Saving model checkpoint to {output_path}")
+        torch.save(self.model.state_dict(), ckpt_path)
+        
+        # Manages the limit of checkpoints to save (CORRECT LOGIC)
+        if self._checkpoints is not None and not is_best and not final:
+            self._checkpoints.append(output_path)
+            if len(self._checkpoints) > self.args.save_total_limit:
+                oldest_ckpt = self._checkpoints.pop(0) # Remove the oldest (first in the list)
+                if os.path.exists(oldest_ckpt):
+                    logger.info(f"Removing old checkpoint: {oldest_ckpt}")
+                    shutil.rmtree(oldest_ckpt)
+                else:
+                    logger.warning(f"Old checkpoint not found at: {oldest_ckpt}, unable to remove.")
+            
+        if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
+            aliases = []
+            if final: aliases.append("final")
+            if is_best: aliases.append("best")
+            self._log_artifact_to_wandb(name, ckpt_path, aliases)
+    
+    def _log_artifact_to_wandb(self, name: str, path: str, aliases: List[str]):
+        """Log model artifact to W&B."""
+        if _WANDB_AVAILABLE:
+            artifact = wandb.Artifact(name=f"{self.args.run_name}", type="model", metadata={"step": name, "model_type": self.model_type})
+            artifact.add_file(path)
+            wandb.log_artifact(artifact, aliases=aliases)
+            logger.info(f"Checkpoint '{name}' uploaded to W&B with aliases: {aliases}.")
+
+    def _check_for_improvement(self, metrics: Dict[str, float]) -> bool:
+        """Check if the monitored metric has improved."""
+        metric_value = metrics.get(self.args.early_stopping_metric)
+        if metric_value is None:
+            return False
+
+        improvement = (metric_value - self.best_metric) if self.metric_greater_is_better else (self.best_metric - metric_value)
+        if improvement > self.args.early_stopping_threshold:
+            self.best_metric = metric_value
+            self.patience_counter = 0
+            logger.info(f"New best metric found: {self.args.early_stopping_metric} = {metric_value:.4f}. Resetting patience counter.")
+            return True
+        else:
+            self.patience_counter += 1
+            logger.info(f"No improvement. Patience counter: {self.patience_counter}/{self.args.early_stopping_patience}.")
             return False
 
     def _check_early_stopping(self) -> bool:

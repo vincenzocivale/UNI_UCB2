@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import timm
+from src.models.vit.pruning import get_global_pruning_indices
+from src.models.vit.input_aware import get_input_aware_and_global_token_indices
+from src.ucb.scoring import calculate_ucb_selection
 
 class UCBAttention(nn.Module):
     """
@@ -25,114 +28,91 @@ class UCBAttention(nn.Module):
 
     def ucb_score_pruning(self, attn_scores, attn_probs, v, iteration, count_score_buffer):
         """
-        Applies UCB-based patch pruning on attention probabilities.
-        Fixed to avoid NaN issues while maintaining correct behavior.
+        Applies UCB-based token selection (pruning) on attention probabilities.
+        This function determines which tokens to keep based on UCB scores and then masks
+        the attention probabilities to only allow interactions with selected tokens.
         """
         B, H, N, _ = attn_scores.shape
         device = v.device
 
-        # Determine dynamic k (number of patches to keep)
+        # Determine the dynamic number of image tokens to keep (keep_k).
+        # `N` is the total sequence length (CLS + image tokens).
         if self.exclude_cls:
-            total_patches = N - 1
-            patch_start_idx = 1
+            total_image_tokens = N - 1 # Exclude CLS token from the pool of prunable tokens
         else:
-            total_patches = N
-            patch_start_idx = 0
+            total_image_tokens = N
 
         if self.keep_ratio is not None:
-            # FIX: Gestisci correttamente keep_ratio=0
             if self.keep_ratio <= 0:
-                k = 0  # Prune TUTTE le patch (mantieni solo CLS)
+                keep_k = 0  # If keep_ratio is 0 or less, no image tokens are kept.
             else:
-                k = max(1, int(total_patches * self.keep_ratio))
+                keep_k = max(1, int(total_image_tokens * self.keep_ratio))
         elif self.k is not None:
-            k = min(self.k, total_patches)
+            keep_k = min(self.k, total_image_tokens)
         else:
-            # If no pruning specified, return original attention
+            # If no pruning configuration is specified, return original attention (no token selection).
             return torch.matmul(self.attn_drop(attn_probs), v), None
 
-        # Se k=0, restituisci solo l'attenzione sul CLS token
-        if k == 0 and self.exclude_cls:
-            # Crea una maschera che mantiene solo il CLS token
+        # Special case: if `keep_k` is 0 and CLS token is excluded, only the CLS token remains.
+        # Create a mask that allows all tokens to attend to CLS, and CLS to attend to all.
+        # This effectively prunes all image tokens.
+        if keep_k == 0 and self.exclude_cls:
             mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
-            mask[:, :, :, 0] = 1.0  # Tutti possono attendere al CLS
-            mask[:, :, 0, :] = 1.0  # CLS può attendere a tutti
+            mask[:, :, :, 0] = 1.0  # All query tokens can attend to the CLS key/value.
+            mask[:, :, 0, :] = 1.0  # The CLS query token can attend to all key/value tokens.
             
             pruned_attn = attn_probs * mask
+            # Renormalize to ensure attention probabilities sum to 1.
             pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
             pruned_attn = self.attn_drop(pruned_attn)
             context = torch.matmul(pruned_attn, v)
             
-            # FIX: Nessun aggiornamento degli score perché nessuna patch è selezionata
-            # Ma incrementa comunque il CLS token per tracking
+            # Since no image tokens are selected, the score_delta only reflects the CLS token's 'selection'.
             score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
-            score_delta[:, 0] += 1.0  # Solo CLS viene "selezionato"
+            score_delta[:, 0] += 1.0  # CLS token is implicitly "selected" for tracking purposes.
             return context, score_delta
 
-        # Calculate patch importance scores - using attention received by each patch
-        if self.exclude_cls:
-            # Average attention each patch receives (excluding CLS)
-            patch_scores = attn_probs[:, :, :, 1:].mean(dim=2)  # (B, H, N-1)
-            relevant_counts = count_score_buffer[:, 1:]  # (H, N-1)
-        else:
-            patch_scores = attn_probs.mean(dim=2)  # (B, H, N)
-            relevant_counts = count_score_buffer  # (H, N)
-
-        # UCB exploration term
-        ucb_exploration = self.beta * torch.sqrt(
-            torch.log(torch.tensor(iteration + 1.0, device=device)) / (relevant_counts + 1e-6)
+        # Calculate UCB selection and corresponding score delta using the external utility function.
+        # This decouples the UCB scoring logic from attention masking.
+        selected_indices, score_delta = calculate_ucb_selection(
+            attn_probs=attn_probs,
+            iteration=iteration,
+            count_score_buffer=count_score_buffer,
+            keep_k=keep_k,
+            beta=self.beta,
+            exclude_cls=self.exclude_cls,
+            device=device
         )
 
-        # Combine scores with exploration bonus
-        ucb_scores = patch_scores + ucb_exploration.unsqueeze(0)  # (B, H, num_patches)
-
-        # Global selection (same patches for all heads in each sample)
-        global_ucb_scores = ucb_scores.mean(dim=1)  # (B, num_patches)
-        _, selected_indices = torch.topk(global_ucb_scores, k=k, dim=-1)  # (B, k)
-
-        # Create attention mask
+        # Create the attention mask based on the `selected_indices` returned by UCB selection.
         mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
         
         if self.exclude_cls:
-            # Always preserve CLS token interactions
-            mask[:, :, :, 0] = 1.0  # All tokens can attend to CLS
-            mask[:, :, 0, :] = 1.0  # CLS can attend to all tokens
-            
-            # Convert patch indices to token indices (add 1 for CLS offset)
-            token_indices = selected_indices + 1  # (B, k)
+            # Always ensure the CLS token interacts with all other tokens it would normally attend to,
+            # and that all tokens can attend to the CLS token.
+            mask[:, :, :, 0] = 1.0  # All query tokens can attend to the CLS key/value.
+            mask[:, :, 0, :] = 1.0  # The CLS query token can attend to all key/value tokens.
             
             for b in range(B):
-                mask[b, :, :, token_indices[b]] = 1.0  # All can attend TO selected
-                mask[b, :, token_indices[b], :] = 1.0  # Selected can attend to ALL
+                # For each sample, allow interactions with the dynamically selected image tokens.
+                # `selected_indices` already contains global token indices (including CLS offset if exclude_cls).
+                mask[b, :, :, selected_indices[b]] = 1.0  # All query tokens can attend TO selected image token key/values.
+                mask[b, :, selected_indices[b], :] = 1.0  # Selected image tokens can attend to ALL key/value tokens.
         else:
+            # If CLS is not excluded, selected_indices directly correspond to `N` tokens.
             for b in range(B):
                 mask[b, :, :, selected_indices[b]] = 1.0  # All can attend TO selected
                 mask[b, :, selected_indices[b], :] = 1.0  # Selected can attend to ALL
 
         pruned_attn = attn_probs * mask
         
-        # Renormalize with epsilon to avoid division by zero
+        # Renormalize to ensure attention probabilities sum to 1 after masking.
         pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
         
         pruned_attn = self.attn_drop(pruned_attn)
 
         context = torch.matmul(pruned_attn, v)
         
-        # Update counts for selected patches
-        # FIX: Assicurati che score_delta sia un tensor float, non int
-        score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
-        
-        if self.exclude_cls:
-            for b in range(B):
-                # Each selected patch gets +1/B to normalize across batch
-                # FIX: Converti selected_indices in long per indexing sicuro
-                indices_to_update = (selected_indices[b] + 1).long()
-                score_delta[:, indices_to_update] += 1.0 / B
-        else:
-            for b in range(B):
-                indices_to_update = selected_indices[b].long()
-                score_delta[:, indices_to_update] += 1.0 / B
-
         return context, score_delta
     
     
@@ -268,108 +248,28 @@ class ViT_UCB_Pruning(nn.Module):
         # It corrects the global pruning based on input-specific attention.
         # It does NOT update UCB counts.
         if not self.training and self.input_aware_extra_tokens > 0:
-            # 1. Perform a single full-token attention pass using ONLY the first transformer block.
-            # We need the attention probabilities from the first block's CLS token to patches.
-            # No UCB pruning here, no UCB count updates.
-            with torch.no_grad(): # Ensure no gradients are tracked for this temporary pass
-                # Create a dummy counter and ucb_count_score for this one-off forward call
-                # These won't be used as ucb_enabled is False, and no_grad() is active.
-                # Use a copy of initial_x to avoid modifying it
-                _, _, attn_probs_first_block = self.blocks[0](
-                    initial_x, 
-                    counter=0, # Counter doesn't matter as ucb_enabled=False
-                    ucb_enabled=False, # Disable UCB pruning for this pass
-                    ucb_count_score=self.ucb_count_scores[0], # Dummy, won't be updated
-                    return_attn_probs=True # Request attention probabilities
-                )
+            # This input-aware correction is applied only during inference/evaluation
+            # to provide a lightweight, input-specific refinement to the
+            # globally learned UCB pruning. It avoids modifying UCB counts or
+            # interfering with training dynamics.
             
-            # attn_probs_first_block shape: (B, H, N_full, N_full)
-            # 2. Use the CLS-to-patch attention from this first block to identify M image-specific patches.
-            # CLS token is at index 0, patches start from index 1.
-            cls_to_patch_attn = attn_probs_first_block[:, :, 0, 1:] # (B, H, N_full - 1)
+            # Use the external utility function to get the merged token indices
+            final_token_indices = get_input_aware_and_global_token_indices(
+                initial_x=initial_x,
+                first_block=self.blocks[0],
+                ucb_count_scores=self.ucb_count_scores,
+                pos_embed_shape=self.pos_embed.shape,
+                global_keep_ratio=self.keep_ratio if self.keep_ratio is not None else 0.5,
+                input_aware_extra_tokens=self.input_aware_extra_tokens,
+                get_global_pruning_indices_fn=get_global_pruning_indices # Pass the function
+            )
             
-            # Average attention over heads for each sample in the batch
-            avg_cls_to_patch_attn = cls_to_patch_attn.mean(dim=1) # (B, N_full - 1)
-            
-            # Select top-M patches per image
-            M = min(self.input_aware_extra_tokens, N_full - 1) # Ensure M doesn't exceed available patches
-            _, input_aware_patch_indices_local = torch.topk(avg_cls_to_patch_attn, k=M, dim=-1) # (B, M)
-            
-            # Convert local patch indices to global token indices (add 1 for CLS offset)
-            input_aware_token_indices = input_aware_patch_indices_local + 1 # (B, M)
-            
-            # 3. Merge these M patches with the K globally selected patches.
-            # Get globally selected patches based on learned UCB scores
-            # Use the model's overall keep_ratio to determine K, or a sensible default if not set.
-            # We assume a global keep_ratio is set for the model.
-            global_keep_ratio = self.keep_ratio if self.keep_ratio is not None else 0.5 # Default global ratio
-            globally_pruned_tokens = self.get_top_k_patch_indices(global_keep_ratio) # (K,)
-            
-            # Initialize final token indices with CLS token for each sample
-            final_token_indices_batch = []
-            
-            for b_idx in range(B):
-                # Start with global tokens, ensuring CLS (index 0) is always there
-                current_sample_tokens = globally_pruned_tokens.to(x.device).clone()
-                
-                # Add input-aware tokens for this sample
-                current_sample_tokens = torch.cat([current_sample_tokens, input_aware_token_indices[b_idx]])
-                
-                # Remove duplicates and sort to preserve deterministic order
-                current_sample_tokens = torch.unique(current_sample_tokens).sort().values
-                
-                final_token_indices_batch.append(current_sample_tokens)
-
-            # Pad or truncate to ensure all samples have the same number of tokens
-            # For simplicity, we'll assume a fixed size for the output of this process
-            # or handle variable length by creating a ragged tensor or iterating,
-            # but batch-wise operation is requested.
-            # For now, let's select the union for each batch element
-            # and then pad them to the max length in the batch.
-            max_len = max(idx.numel() for idx in final_token_indices_batch)
-            padded_final_token_indices_batch = torch.zeros(B, max_len, dtype=torch.long, device=x.device)
-            
-            # We fill the tokens and use -1 for padding.
-            # Then we can filter these -1s later or ensure our index_select handles it.
-            # A simpler way: we'll perform index_select iteratively per batch element
-            # and then stack them, if sizes differ. If sizes are uniform, it's easier.
-            # The prompt requests "batch-wise operation (no Python loops over batch)".
-            # This implies `torch.index_select` which needs uniform indices across batch.
-            # So, we should determine a single set of indices to apply to the whole batch.
-            # This contradicts "top-M patches *per image*".
-
-            # Re-evaluating: "Merge these M patches with the K globally selected patches."
-            # "The final token set = union(global_pruned_tokens, input_aware_tokens)"
-            # This implies a single set of tokens to be used for the entire batch.
-            # This is simpler and aligns with the batch-wise operation constraint.
-            # So, instead of per-image M, I'll select M patches from the *mean* attention over the batch.
-
-            # Re-calculation for single set of tokens across batch
-            avg_cls_to_patch_attn_across_batch = avg_cls_to_patch_attn.mean(dim=0) # (N_full - 1)
-            _, input_aware_patch_indices_global_single = torch.topk(
-                avg_cls_to_patch_attn_across_batch, k=M, dim=-1
-            ) # (M,)
-            input_aware_token_indices_global_single = input_aware_patch_indices_global_single + 1 # (M,)
-            
-            # Merge global UCB tokens with global input-aware tokens
-            final_token_indices = torch.cat([
-                globally_pruned_tokens.to(x.device),
-                input_aware_token_indices_global_single
-            ])
-            final_token_indices = torch.unique(final_token_indices).sort().values
-            
-            # 4. Continue the forward pass using only the merged token set.
+            # Apply physical pruning to the token sequence
             x = torch.index_select(x, dim=1, index=final_token_indices)
             
             # When input-aware pruning is active, UCB pruning inside blocks is not needed
             # as physical pruning is already applied.
             ucb_enabled_for_blocks = False
-            
-            # Add comment explaining why this is inference-only
-            # This input-aware correction is applied only during inference/evaluation
-            # to provide a lightweight, input-specific refinement to the
-            # globally learned UCB pruning. It avoids modifying UCB counts or
-            # interfering with training dynamics.
         else:
             # If not in evaluation or input_aware_extra_tokens is 0,
             # proceed with standard UCB pruning as configured.
@@ -400,41 +300,7 @@ class ViT_UCB_Pruning(nn.Module):
             return loss, logits
         return logits
 
-    def get_top_k_patch_indices(self, keep_ratio: float):
-        """
-        Analyzes the learned ucb_count_scores to find the most important patch indices.
 
-        Args:
-            keep_ratio (float): The ratio of patches to keep (e.g., 0.7 for 70%).
-
-        Returns:
-            torch.Tensor: A 1D tensor containing the indices of tokens to keep,
-                          including the CLS token.
-        """
-        # Exclude CLS token from importance calculation
-        # Scores are averaged across all layers and heads
-        patch_scores = self.ucb_count_scores[:, :, 1:].mean(dim=(0, 1))
-        
-        # FIX: Gestisci keep_ratio=0
-        if keep_ratio <= 0:
-            # Ritorna solo il CLS token
-            return torch.tensor([0], device=patch_scores.device)
-        
-        num_patches_to_keep = max(1, int(patch_scores.shape[0] * keep_ratio))
-        
-        # Get the indices of the patches with the highest scores
-        top_patch_indices = torch.topk(patch_scores, k=num_patches_to_keep, dim=-1).indices
-        
-        # Add 1 to offset for the CLS token we excluded
-        token_indices = top_patch_indices + 1
-        
-        # Always include the CLS token (index 0)
-        cls_token_index = torch.tensor([0], device=token_indices.device)
-        
-        # Concatenate and sort for predictable order
-        final_indices = torch.cat([cls_token_index, token_indices]).sort().values
-        
-        return final_indices
 
     def forward_pruned(self, x: torch.Tensor, top_k_indices: torch.Tensor):
         x = self.patch_embed(x)
@@ -442,49 +308,53 @@ class ViT_UCB_Pruning(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        print(f"PRUNING: Tensor shape before: {x.shape[1]} tokens")
+        # Physically prune the tokens based on the provided top_k_indices.
         x = torch.index_select(x, dim=1, index=top_k_indices.to(x.device))
-        print(f"PRUNING: Tensor shape after: {x.shape[1]} tokens")
 
-        # Process the reduced set of tokens through the transformer blocks
-        # We disable UCB logic since pruning is already done
+        # Process the reduced set of tokens through the transformer blocks.
+        # UCB logic is disabled here since physical pruning has already occurred.
         for i, block in enumerate(self.blocks):
             x, _ = block(
                 x, 
-                counter=99999,
-                ucb_enabled=False,  # Disabilita UCB durante inferenza pruned
-                ucb_count_score=None
+                counter=99999, # Dummy value, as ucb_enabled=False
+                ucb_enabled=False,  # Disable UCB updates/pruning within blocks
+                ucb_count_score=None # Not used when ucb_enabled=False
             )
             
-        # Final norm and classification (CLS token is still at index 0)
+        # Final normalization and classification (CLS token is always at index 0 in the pruned sequence).
         x = self.norm(x)
         logits = self.head(x[:, 0])
         
         return logits
 
     def get_pruning_stats(self):
-        """Returns statistics about current pruning configuration and state."""
+        """
+        Returns statistics about the current UCB pruning configuration and state.
+        This provides insights into the learned token importances.
+        """
         stats = {
             'num_layers': len(self.blocks),
             'num_heads': self.blocks[0].attn.num_heads,
-            'total_patches': self.pos_embed.shape[1],
+            'total_tokens': self.pos_embed.shape[1], # Total tokens including CLS
         }
         
-        # Add per-layer pruning configuration
+        # Add per-layer pruning configuration based on the attention modules.
         for i, block in enumerate(self.blocks):
+            # The `keep_ratio` or `k` attributes determine the pruning configuration.
             if hasattr(block.attn, 'keep_ratio') and block.attn.keep_ratio is not None:
                 stats[f'layer_{i}_keep_ratio'] = block.attn.keep_ratio
-                stats[f'layer_{i}_kept_patches'] = int(
+                # Calculate the number of tokens kept per layer (excluding CLS if specified).
+                stats[f'layer_{i}_kept_tokens'] = int(
                     (self.pos_embed.shape[1] - (1 if block.attn.exclude_cls else 0)) * block.attn.keep_ratio
                 )
             elif hasattr(block.attn, 'k') and block.attn.k is not None:
-                total_patches = self.pos_embed.shape[1] - (1 if block.attn.exclude_cls else 0)
-                stats[f'layer_{i}_keep_ratio'] = block.attn.k / total_patches
-                stats[f'layer_{i}_kept_patches'] = block.attn.k
+                total_tokens_for_k = self.pos_embed.shape[1] - (1 if block.attn.exclude_cls else 0)
+                stats[f'layer_{i}_keep_ratio'] = block.attn.k / total_tokens_for_k
+                stats[f'layer_{i}_kept_tokens'] = block.attn.k
                 
-        # Add UCB statistics
-        stats['avg_patch_counts'] = self.ucb_count_scores.mean(dim=(0, 1)).cpu().numpy()
-        stats['min_patch_count'] = self.ucb_count_scores.min().item()
-        stats['max_patch_count'] = self.ucb_count_scores.max().item()
+        # Add UCB statistics from the accumulated count scores.
+        stats['avg_token_counts'] = self.ucb_count_scores.mean(dim=(0, 1)).cpu().numpy()
+        stats['min_token_count'] = self.ucb_count_scores.min().item()
+        stats['max_token_count'] = self.ucb_count_scores.max().item()
         
         return stats
