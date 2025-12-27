@@ -77,7 +77,7 @@ def main(args):
                 project=args.wandb_project,
                 name=f"{args.run_name}_{stage_name}",
                 reinit=True,
-                config={{**vars(args), "keep_ratio": keep_ratio, "stage": i+1}}
+                config={**vars(args), "keep_ratio": keep_ratio, "stage": i+1}
             )
 
         # --- Model Setup ---
@@ -111,6 +111,7 @@ def main(args):
             load_best_model_at_end=True,
             metric_for_best_model="eval_f1_macro",
             greater_is_better=True,
+            dataloader_num_workers=4
         )
 
         optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
@@ -182,11 +183,11 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="vit-pruning-merging", help="Base name for the WandB run.")
     parser.add_argument("--img_size", type=int, default=224, help="Image size.")
     parser.add_argument("--batch_size", type=int, default=12, help="Batch size for training and evaluation.")
-    parser.add_argument("--num_epochs", type=int, default=30, help="Number of epochs for each stage.")
-    parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs for each stage.")
+    parser.add_argument("--learning_rate", type=float, default=1e-2, help="Learning rate.")
     parser.add_argument("--model_name", type=str, default="hf-hub:MahmoodLab/uni", help="Name of the pretrained model from timm.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-    parser.add_argument("--use_wandb", action='store_true', help="Flag to enable WandB logging.")
+    parser.add_argument("--use_wandb", default=True, action='store_true', help="Flag to enable WandB logging.")
     parser.add_argument("--wandb_project", type=str, default="vit_pruning", help="WandB project name.")
     parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping.")
 
