@@ -60,6 +60,7 @@ class TrainingArguments:
     # New parameter to specify model type
     model_type: str = "ucb"  # "ucb", "random", or "baseline"
     freeze_backbone: bool = False # Nuovo argomento per congelare il backbone
+    input_aware_extra_tokens: int = 0
 
 class ModelTrainer:
     def __init__(

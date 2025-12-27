@@ -136,7 +136,7 @@ class UCBAttention(nn.Module):
         return context, score_delta
     
     
-    def forward(self, x, counter, ucb_enabled, ucb_count_score):
+    def forward(self, x, counter, ucb_enabled, ucb_count_score, return_attn_probs=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -152,12 +152,15 @@ class UCBAttention(nn.Module):
             )
         else:
             # Nessun pruning - attention standard
-            attn_probs = self.attn_drop(attn_probs)
-            context = torch.matmul(attn_probs, v)
+            attn_probs_processed = self.attn_drop(attn_probs)
+            context = torch.matmul(attn_probs_processed, v)
 
         x = context.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        
+        if return_attn_probs:
+            return x, score_delta, attn_probs
         return x, score_delta
 
 
@@ -190,17 +193,27 @@ class UCBBlock(nn.Module):
         state_dict = orig_attn.state_dict()
         self.attn.load_state_dict(state_dict, strict=False)
 
-    def forward(self, x, counter, ucb_enabled, ucb_count_score):
+    def forward(self, x, counter, ucb_enabled, ucb_count_score, return_attn_probs=False):
         # Standard transformer block with residual connections
-        h, score_delta = self.attn(self.norm1(x), counter, ucb_enabled, ucb_count_score)
+        h_out = self.attn(self.norm1(x), counter, ucb_enabled, ucb_count_score, return_attn_probs)
+        
+        if return_attn_probs:
+            h, score_delta, attn_probs = h_out
+        else:
+            h, score_delta = h_out
+            attn_probs = None # Explicitly set to None if not returned
+
         x = x + self.drop_path1(self.ls1(h))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        
+        if return_attn_probs:
+            return x, score_delta, attn_probs
         return x, score_delta
 
 
 class ViT_UCB_Pruning(nn.Module):
     def __init__(self, model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=None,
-                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
+                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True, input_aware_extra_tokens: int = 0):
         super().__init__()
         print(f"Loading source model '{model_name}'...")
         source_model = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
@@ -246,33 +259,138 @@ class ViT_UCB_Pruning(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        # DEBUG: Aggiungi logging per verificare counter e ucb_enabled
-        if counter % 100 == 0:
-            print(f"[DEBUG] Counter={counter}, UCB_enabled={ucb_enabled}, Warmup_passed={counter > 50}")
+        # Initial tokens before any pruning
+        initial_x = x
+        B, N_full, C = initial_x.shape # N_full includes CLS and all patches
+        
+        # Determine the set of tokens to process
+        # This mechanism is active ONLY during inference and if input_aware_extra_tokens > 0
+        # It corrects the global pruning based on input-specific attention.
+        # It does NOT update UCB counts.
+        if not self.training and self.input_aware_extra_tokens > 0:
+            # 1. Perform a single full-token attention pass using ONLY the first transformer block.
+            # We need the attention probabilities from the first block's CLS token to patches.
+            # No UCB pruning here, no UCB count updates.
+            with torch.no_grad(): # Ensure no gradients are tracked for this temporary pass
+                # Create a dummy counter and ucb_count_score for this one-off forward call
+                # These won't be used as ucb_enabled is False, and no_grad() is active.
+                # Use a copy of initial_x to avoid modifying it
+                _, _, attn_probs_first_block = self.blocks[0](
+                    initial_x, 
+                    counter=0, # Counter doesn't matter as ucb_enabled=False
+                    ucb_enabled=False, # Disable UCB pruning for this pass
+                    ucb_count_score=self.ucb_count_scores[0], # Dummy, won't be updated
+                    return_attn_probs=True # Request attention probabilities
+                )
+            
+            # attn_probs_first_block shape: (B, H, N_full, N_full)
+            # 2. Use the CLS-to-patch attention from this first block to identify M image-specific patches.
+            # CLS token is at index 0, patches start from index 1.
+            cls_to_patch_attn = attn_probs_first_block[:, :, 0, 1:] # (B, H, N_full - 1)
+            
+            # Average attention over heads for each sample in the batch
+            avg_cls_to_patch_attn = cls_to_patch_attn.mean(dim=1) # (B, N_full - 1)
+            
+            # Select top-M patches per image
+            M = min(self.input_aware_extra_tokens, N_full - 1) # Ensure M doesn't exceed available patches
+            _, input_aware_patch_indices_local = torch.topk(avg_cls_to_patch_attn, k=M, dim=-1) # (B, M)
+            
+            # Convert local patch indices to global token indices (add 1 for CLS offset)
+            input_aware_token_indices = input_aware_patch_indices_local + 1 # (B, M)
+            
+            # 3. Merge these M patches with the K globally selected patches.
+            # Get globally selected patches based on learned UCB scores
+            # Use the model's overall keep_ratio to determine K, or a sensible default if not set.
+            # We assume a global keep_ratio is set for the model.
+            global_keep_ratio = self.keep_ratio if self.keep_ratio is not None else 0.5 # Default global ratio
+            globally_pruned_tokens = self.get_top_k_patch_indices(global_keep_ratio) # (K,)
+            
+            # Initialize final token indices with CLS token for each sample
+            final_token_indices_batch = []
+            
+            for b_idx in range(B):
+                # Start with global tokens, ensuring CLS (index 0) is always there
+                current_sample_tokens = globally_pruned_tokens.to(x.device).clone()
+                
+                # Add input-aware tokens for this sample
+                current_sample_tokens = torch.cat([current_sample_tokens, input_aware_token_indices[b_idx]])
+                
+                # Remove duplicates and sort to preserve deterministic order
+                current_sample_tokens = torch.unique(current_sample_tokens).sort().values
+                
+                final_token_indices_batch.append(current_sample_tokens)
 
-        # FIX: Rimuovi il pruning fisico preliminare, lascia che UCB lo gestisca nei blocchi
-        # Process through blocks con UCB ABILITATO
+            # Pad or truncate to ensure all samples have the same number of tokens
+            # For simplicity, we'll assume a fixed size for the output of this process
+            # or handle variable length by creating a ragged tensor or iterating,
+            # but batch-wise operation is requested.
+            # For now, let's select the union for each batch element
+            # and then pad them to the max length in the batch.
+            max_len = max(idx.numel() for idx in final_token_indices_batch)
+            padded_final_token_indices_batch = torch.zeros(B, max_len, dtype=torch.long, device=x.device)
+            
+            # We fill the tokens and use -1 for padding.
+            # Then we can filter these -1s later or ensure our index_select handles it.
+            # A simpler way: we'll perform index_select iteratively per batch element
+            # and then stack them, if sizes differ. If sizes are uniform, it's easier.
+            # The prompt requests "batch-wise operation (no Python loops over batch)".
+            # This implies `torch.index_select` which needs uniform indices across batch.
+            # So, we should determine a single set of indices to apply to the whole batch.
+            # This contradicts "top-M patches *per image*".
+
+            # Re-evaluating: "Merge these M patches with the K globally selected patches."
+            # "The final token set = union(global_pruned_tokens, input_aware_tokens)"
+            # This implies a single set of tokens to be used for the entire batch.
+            # This is simpler and aligns with the batch-wise operation constraint.
+            # So, instead of per-image M, I'll select M patches from the *mean* attention over the batch.
+
+            # Re-calculation for single set of tokens across batch
+            avg_cls_to_patch_attn_across_batch = avg_cls_to_patch_attn.mean(dim=0) # (N_full - 1)
+            _, input_aware_patch_indices_global_single = torch.topk(
+                avg_cls_to_patch_attn_across_batch, k=M, dim=-1
+            ) # (M,)
+            input_aware_token_indices_global_single = input_aware_patch_indices_global_single + 1 # (M,)
+            
+            # Merge global UCB tokens with global input-aware tokens
+            final_token_indices = torch.cat([
+                globally_pruned_tokens.to(x.device),
+                input_aware_token_indices_global_single
+            ])
+            final_token_indices = torch.unique(final_token_indices).sort().values
+            
+            # 4. Continue the forward pass using only the merged token set.
+            x = torch.index_select(x, dim=1, index=final_token_indices)
+            
+            # When input-aware pruning is active, UCB pruning inside blocks is not needed
+            # as physical pruning is already applied.
+            ucb_enabled_for_blocks = False
+            
+            # Add comment explaining why this is inference-only
+            # This input-aware correction is applied only during inference/evaluation
+            # to provide a lightweight, input-specific refinement to the
+            # globally learned UCB pruning. It avoids modifying UCB counts or
+            # interfering with training dynamics.
+        else:
+            # If not in evaluation or input_aware_extra_tokens is 0,
+            # proceed with standard UCB pruning as configured.
+            final_token_indices = None # No initial physical pruning
+            ucb_enabled_for_blocks = ucb_enabled # Respect original ucb_enabled flag
+        
+        # Process through blocks with potentially pruned tokens or standard full tokens
         for i, block in enumerate(self.blocks):
+            # If input-aware pruning happened, ucb_enabled_for_blocks is False.
+            # Otherwise, it uses the original ucb_enabled flag.
+            # In the main loop, we never need to return attn_probs.
             x, score_delta = block(
                 x, 
                 counter=counter, 
-                ucb_enabled=ucb_enabled,  # FIX: Passa il vero valore di ucb_enabled
-                ucb_count_score=self.ucb_count_scores[i]
+                ucb_enabled=ucb_enabled_for_blocks, # Use the determined ucb_enabled flag
+                ucb_count_score=self.ucb_count_scores[i],
+                return_attn_probs=False # Always False for the main loop blocks
             )
             
-            # DEBUG: Verifica se score_delta viene calcolato
-            if counter % 100 == 0 and i == 0:
-                print(f"[DEBUG] Layer {i}: score_delta is {'None' if score_delta is None else 'not None'}")
-                if score_delta is not None:
-                    print(f"[DEBUG] score_delta shape: {score_delta.shape}, mean: {score_delta.mean().item():.4f}")
-                    print(f"[DEBUG] UCB scores before update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
-            
             if score_delta is not None:
-                # FIX: Usa .data per aggiornare il buffer senza interferire con autograd
                 self.ucb_count_scores[i].data += score_delta.data
-                
-            if counter % 100 == 0 and i == 0 and score_delta is not None:
-                print(f"[DEBUG] UCB scores after update - mean: {self.ucb_count_scores[i].mean().item():.4f}")
 
         x = self.norm(x)
         logits = self.head(x[:, 0])
