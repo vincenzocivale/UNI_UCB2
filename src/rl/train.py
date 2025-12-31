@@ -397,11 +397,11 @@ class ModelTrainer:
             
             # Basic UCB statistics
             metrics_dict.update({
-                "pruning/ucb_sparsity": (ucb_counts == 0).sum().item() / ucb_counts.numel(),
-                "pruning/ucb_mean_selection_count": ucb_counts.mean().item(),
-                "pruning/ucb_max_selection_count": ucb_counts.max().item(),
-                "pruning/ucb_min_selection_count": ucb_counts.min().item(),
-                "pruning/ucb_selection_std": ucb_counts.std().item(),
+                "pruning/ucb_sparsity": (ucb_scores == 0).sum().item() / ucb_scores.numel(),
+                "pruning/ucb_mean_selection_count": ucb_scores.mean().item(),
+                "pruning/ucb_max_selection_count": ucb_scores.max().item(),
+                "pruning/ucb_min_selection_count": ucb_scores.min().item(),
+                "pruning/ucb_selection_std": ucb_scores.std().item(),
             })
             
             # Input-aware specific metrics (for Option A)
@@ -413,17 +413,9 @@ class ModelTrainer:
             for layer_idx, layer_mean in enumerate(layer_means):
                 metrics_dict[f"pruning/ucb_layer_{layer_idx}_mean"] = layer_mean.item()
             
-            # Input-aware specific metrics (for Option A)
-            if hasattr(self.model, 'input_aware_weight'):
-                metrics_dict["pruning/input_aware_weight"] = self.model.input_aware_weight
-            
-            # Per-layer statistics
-            layer_means = ucb_scores.mean(dim=(1, 2))  # Average over heads and patches per layer
-            for layer_idx, layer_mean in enumerate(layer_means):
-                metrics_dict[f"pruning/ucb_layer_{layer_idx}_mean"] = layer_mean.item()
-            
+
             if _WANDB_AVAILABLE:
-                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_counts.cpu().numpy())
+                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_scores.cpu().numpy())
 
     def _log_random_metrics(self, metrics_dict: Dict):
         """Log Random pruning-specific metrics."""
