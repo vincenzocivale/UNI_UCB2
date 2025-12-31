@@ -116,7 +116,7 @@ class ModelTrainer:
             config = vars(self.args).copy()
             config['model_type'] = self.model_type
             
-            wandb.init(project="vit-ucb-pruning3", name=self.args.run_name, config=config)
+            wandb.init(project="vit-ucb-dynamic-pruning", name=self.args.run_name, config=config)
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
         # Checkpoint management

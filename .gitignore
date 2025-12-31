@@ -11,3 +11,4 @@ wandb/
 .venv/
 *_pycache__/
 *.out
+/data/

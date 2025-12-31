@@ -48,9 +48,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --------------------------------------------------
-    # DATASET + UNDERSAMPLING
+    # DATASET + WEIGHTED RANDOM SAMPLER (NO UNDERSAMPLING)
     # --------------------------------------------------
-    logger.info("Loading dataset")
+    logger.info("Loading dataset (WeightedRandomSampler, no undersampling)")
+
     dataset = PatchFromH5Dataset(
         h5_dir=args.h5_dir,
         transform=transforms.Compose([
@@ -62,44 +63,43 @@ def main():
         ])
     )
 
-    labels = dataset.labels
-    df = pd.DataFrame({
-        "index": np.arange(len(labels)),
-        "label": labels
-    })
+    labels = np.array(dataset.labels)
+    indices = np.arange(len(labels))
 
-    # Undersampling
-    min_count = df["label"].value_counts().min()
-    logger.info(f"Undersampling to {min_count} samples per class")
-
-    undersampled_df = (
-        df.groupby("label", group_keys=False)
-          .apply(lambda x: x.sample(n=min_count, random_state=args.seed))
-          .reset_index(drop=True)
-    )
-
-    undersampled_indices = undersampled_df["index"].values
-    undersampled_labels = undersampled_df["label"].values
-
-    # Global shuffle
-    perm = np.random.RandomState(args.seed).permutation(len(undersampled_indices))
-    undersampled_indices = undersampled_indices[perm]
-    undersampled_labels = undersampled_labels[perm]
-
-    # Train/val split
+    # Train / Val split (stratified, full dataset)
     train_idx, val_idx = train_test_split(
-        undersampled_indices,
+        indices,
         test_size=0.3,
-        stratify=undersampled_labels,
+        stratify=labels,
         random_state=args.seed
     )
 
     logger.info(f"Train size: {len(train_idx)}, Val size: {len(val_idx)}")
 
+    # --------------------------------------------------
+    # WEIGHTED RANDOM SAMPLER (TRAIN ONLY)
+    # --------------------------------------------------
+    train_labels = labels[train_idx]
+
+    class_counts = np.bincount(train_labels)
+    class_weights = 1.0 / class_counts
+
+    sample_weights = class_weights[train_labels]
+    sample_weights = torch.from_numpy(sample_weights).double()
+
+    train_sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+    # --------------------------------------------------
+    # DATALOADERS
+    # --------------------------------------------------
     train_loader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=args.train_batch_size,
-        shuffle=True,
+        sampler=train_sampler,   # <-- sampler, NON shuffle
         num_workers=8,
         drop_last=True
     )
