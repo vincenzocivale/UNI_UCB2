@@ -1,18 +1,31 @@
 import torch
 import torch.nn as nn
 import timm
-from src.models.vit.pruning import get_global_pruning_indices
-from src.models.vit.input_aware import get_input_aware_and_global_token_indices
-from src.ucb.scoring import calculate_ucb_selection
 
+
+# ---------------------------------------------------------
+# UCB ATTENTION
+# ---------------------------------------------------------
 class UCBAttention(nn.Module):
-    """
-    Corrected UCB Attention module with proper patch pruning.
-    """
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
-                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        qkv_bias=False,
+        attn_drop=0.,
+        proj_drop=0.,
+        keep_ratio=None,
+        beta=1.0,
+        exclude_cls=True,
+        ucb_warmup_steps=50,
+    ):
         super().__init__()
         self.num_heads = num_heads
+        self.exclude_cls = exclude_cls
+        self.keep_ratio = keep_ratio
+        self.beta = beta
+        self.ucb_warmup_steps = ucb_warmup_steps
+
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
@@ -21,340 +34,294 @@ class UCBAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.k = k
-        self.keep_ratio = keep_ratio
-        self.beta = beta
-        self.exclude_cls = exclude_cls
-
-    def ucb_score_pruning(self, attn_scores, attn_probs, v, iteration, count_score_buffer):
-        """
-        Applies UCB-based token selection (pruning) on attention probabilities.
-        This function determines which tokens to keep based on UCB scores and then masks
-        the attention probabilities to only allow interactions with selected tokens.
-        """
-        B, H, N, _ = attn_scores.shape
-        device = v.device
-
-        # Determine the dynamic number of image tokens to keep (keep_k).
-        # `N` is the total sequence length (CLS + image tokens).
-        if self.exclude_cls:
-            total_image_tokens = N - 1 # Exclude CLS token from the pool of prunable tokens
-        else:
-            total_image_tokens = N
-
-        if self.keep_ratio is not None:
-            if self.keep_ratio <= 0:
-                keep_k = 0  # If keep_ratio is 0 or less, no image tokens are kept.
-            else:
-                keep_k = max(1, int(total_image_tokens * self.keep_ratio))
-        elif self.k is not None:
-            keep_k = min(self.k, total_image_tokens)
-        else:
-            # If no pruning configuration is specified, return original attention (no token selection).
-            return torch.matmul(self.attn_drop(attn_probs), v), None
-
-        # Special case: if `keep_k` is 0 and CLS token is excluded, only the CLS token remains.
-        # Create a mask that allows all tokens to attend to CLS, and CLS to attend to all.
-        # This effectively prunes all image tokens.
-        if keep_k == 0 and self.exclude_cls:
-            mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
-            mask[:, :, :, 0] = 1.0  # All query tokens can attend to the CLS key/value.
-            mask[:, :, 0, :] = 1.0  # The CLS query token can attend to all key/value tokens.
-            
-            pruned_attn = attn_probs * mask
-            # Renormalize to ensure attention probabilities sum to 1.
-            pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
-            pruned_attn = self.attn_drop(pruned_attn)
-            context = torch.matmul(pruned_attn, v)
-            
-            # Since no image tokens are selected, the score_delta only reflects the CLS token's 'selection'.
-            score_delta = torch.zeros_like(count_score_buffer, dtype=torch.float32)
-            score_delta[:, 0] += 1.0  # CLS token is implicitly "selected" for tracking purposes.
-            return context, score_delta
-
-        # Calculate UCB selection and corresponding score delta using the external utility function.
-        # This decouples the UCB scoring logic from attention masking.
-        selected_indices, score_delta = calculate_ucb_selection(
-            attn_probs=attn_probs,
-            iteration=iteration,
-            count_score_buffer=count_score_buffer,
-            keep_k=keep_k,
-            beta=self.beta,
-            exclude_cls=self.exclude_cls,
-            device=device
-        )
-
-        # Create the attention mask based on the `selected_indices` returned by UCB selection.
-        mask = torch.zeros(B, H, N, N, device=device, dtype=attn_probs.dtype)
-        
-        if self.exclude_cls:
-            # Always ensure the CLS token interacts with all other tokens it would normally attend to,
-            # and that all tokens can attend to the CLS token.
-            mask[:, :, :, 0] = 1.0  # All query tokens can attend to the CLS key/value.
-            mask[:, :, 0, :] = 1.0  # The CLS query token can attend to all key/value tokens.
-            
-            for b in range(B):
-                # For each sample, allow interactions with the dynamically selected image tokens.
-                # `selected_indices` already contains global token indices (including CLS offset if exclude_cls).
-                mask[b, :, :, selected_indices[b]] = 1.0  # All query tokens can attend TO selected image token key/values.
-                mask[b, :, selected_indices[b], :] = 1.0  # Selected image tokens can attend to ALL key/value tokens.
-        else:
-            # If CLS is not excluded, selected_indices directly correspond to `N` tokens.
-            for b in range(B):
-                mask[b, :, :, selected_indices[b]] = 1.0  # All can attend TO selected
-                mask[b, :, selected_indices[b], :] = 1.0  # Selected can attend to ALL
-
-        pruned_attn = attn_probs * mask
-        
-        # Renormalize to ensure attention probabilities sum to 1 after masking.
-        pruned_attn = pruned_attn / (pruned_attn.sum(dim=-1, keepdim=True) + 1e-8)
-        
-        pruned_attn = self.attn_drop(pruned_attn)
-
-        context = torch.matmul(pruned_attn, v)
-        
-        return context, score_delta
-    
-    
-    def forward(self, x, counter, ucb_enabled, ucb_count_score, return_attn_probs=False):
+    def forward(self, x, counter, ucb_enabled, ucb_count_scores, return_attn=False):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv.unbind(0)
 
-        attn_scores = (q @ k.transpose(-1, -2)) * self.scale
-        attn_probs = attn_scores.softmax(dim=-1)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn_probs = attn.softmax(dim=-1)
 
         score_delta = None
-        # FIX: Applica pruning SOLO se ucb_enabled=True E dopo warm-up
-        if ucb_enabled and counter > 50:
-            context, score_delta = self.ucb_score_pruning(
-                attn_scores, attn_probs, v, iteration=counter, count_score_buffer=ucb_count_score
+
+        # -------------------------------------------------
+        # UCB SOFT PRUNING (TRAINING ONLY)
+        # -------------------------------------------------
+        if (
+            ucb_enabled
+            and counter >= self.ucb_warmup_steps
+            and self.keep_ratio is not None
+        ):
+            patch_start = 1 if self.exclude_cls else 0
+            num_patches = N - patch_start
+            k_keep = max(1, int(num_patches * self.keep_ratio))
+
+            patch_scores = attn_probs[:, :, :, patch_start:].mean(dim=2)
+            counts = ucb_count_scores[:, patch_start:]
+
+            ucb_bonus = self.beta * torch.sqrt(
+                torch.log(torch.tensor(counter + 1.0, device=x.device))
+                / (counts + 1e-6)
             )
-        else:
-            # Nessun pruning - attention standard
-            attn_probs_processed = self.attn_drop(attn_probs)
-            context = torch.matmul(attn_probs_processed, v)
 
-        x = context.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        
-        if return_attn_probs:
-            return x, score_delta, attn_probs
-        return x, score_delta
+            ucb_scores = patch_scores + ucb_bonus.unsqueeze(0)
+            global_scores = ucb_scores.mean(dim=1)
+            _, topk = torch.topk(global_scores, k=k_keep, dim=-1)
+
+            mask = torch.zeros_like(attn_probs)
+
+            # CLS always preserved
+            if self.exclude_cls:
+                mask[:, :, :, 0] = 1.0
+                mask[:, :, 0, :] = 1.0
+                topk = topk + 1
+
+            for b in range(B):
+                mask[b, :, :, topk[b]] = 1.0
+                mask[b, :, topk[b], :] = 1.0
+
+            attn_probs = attn_probs * mask
+            attn_probs = attn_probs / (attn_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+            score_delta = torch.zeros_like(ucb_count_scores)
+            for b in range(B):
+                score_delta[:, topk[b]] += 1.0 / B
+
+        attn_probs_dropped = self.attn_drop(attn_probs)
+        x_out = (attn_probs_dropped @ v).transpose(1, 2).reshape(B, N, C)
+        x_out = self.proj_drop(self.proj(x_out))
+
+        if return_attn:
+            return x_out, score_delta, attn_probs
+        return x_out, score_delta
 
 
+# ---------------------------------------------------------
+# UCB BLOCK
+# ---------------------------------------------------------
 class UCBBlock(nn.Module):
-    def __init__(self, original_block: nn.Module, **ucb_kwargs):
+    def __init__(self, block, **ucb_kwargs):
         super().__init__()
-        # Copy all components from original block
-        self.norm1 = original_block.norm1
-        self.norm2 = original_block.norm2
-        self.mlp = original_block.mlp
-        
-        # Handle different timm versions
-        self.ls1 = getattr(original_block, 'ls1', nn.Identity())
-        self.ls2 = getattr(original_block, 'ls2', nn.Identity())
-        self.drop_path1 = getattr(original_block, 'drop_path1', nn.Identity())
-        self.drop_path2 = getattr(original_block, 'drop_path2', nn.Identity())
+        self.norm1 = block.norm1
+        self.norm2 = block.norm2
+        self.mlp = block.mlp
 
-        # Replace attention with UCB version
-        orig_attn = original_block.attn
+        self.ls1 = getattr(block, "ls1", nn.Identity())
+        self.ls2 = getattr(block, "ls2", nn.Identity())
+        self.drop_path1 = getattr(block, "drop_path1", nn.Identity())
+        self.drop_path2 = getattr(block, "drop_path2", nn.Identity())
+
         self.attn = UCBAttention(
-            dim=orig_attn.qkv.in_features,
-            num_heads=orig_attn.num_heads,
-            qkv_bias=orig_attn.qkv.bias is not None,
-            attn_drop=orig_attn.attn_drop.p if hasattr(orig_attn.attn_drop, 'p') else 0.0,
-            proj_drop=orig_attn.proj_drop.p if hasattr(orig_attn.proj_drop, 'p') else 0.0,
-            **ucb_kwargs
+            dim=block.attn.qkv.in_features,
+            num_heads=block.attn.num_heads,
+            qkv_bias=block.attn.qkv.bias is not None,
+            attn_drop=block.attn.attn_drop.p,
+            proj_drop=block.attn.proj_drop.p,
+            **ucb_kwargs,
         )
-        
-        # Load weights from original attention
-        state_dict = orig_attn.state_dict()
-        self.attn.load_state_dict(state_dict, strict=False)
+        self.attn.load_state_dict(block.attn.state_dict(), strict=False)
 
-    def forward(self, x, counter, ucb_enabled, ucb_count_score, return_attn_probs=False):
-        # Standard transformer block with residual connections
-        h_out = self.attn(self.norm1(x), counter, ucb_enabled, ucb_count_score, return_attn_probs)
-        
-        if return_attn_probs:
-            h, score_delta, attn_probs = h_out
-        else:
-            h, score_delta = h_out
-            attn_probs = None # Explicitly set to None if not returned
-
-        x = x + self.drop_path1(self.ls1(h))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
-        
-        if return_attn_probs:
+    def forward(self, x, counter, ucb_enabled, ucb_count_scores, return_attn=False):
+        if return_attn:
+            h, score_delta, attn_probs = self.attn(
+                self.norm1(x), counter, ucb_enabled, ucb_count_scores, return_attn=True
+            )
+            x = x + self.drop_path1(self.ls1(h))
+            x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
             return x, score_delta, attn_probs
-        return x, score_delta
-
-
-class ViT_UCB_Pruning(nn.Module):
-    def __init__(self, model_name="hf-hub:MahmoodLab/uni", pretrained=True, n_classes=None,
-                 k=None, keep_ratio=None, beta=1.0, exclude_cls=True, input_aware_extra_tokens: int = 0):
-        super().__init__()
-        print(f"Loading source model '{model_name}'...")
-        source_model = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
-
-        self.keep_ratio = keep_ratio
-
-        # Copy patch embedding and positional components
-        self.patch_embed = source_model.patch_embed
-        self.cls_token = source_model.cls_token
-        self.pos_embed = source_model.pos_embed
-        self.pos_drop = source_model.pos_drop
-        self.norm = source_model.norm
-        
-        # Setup classification head
-        if hasattr(source_model, 'head'):
-            if hasattr(source_model.head, 'in_features'):
-                head_dim = source_model.head.in_features
-            else:
-                head_dim = source_model.head.weight.shape[1] if hasattr(source_model.head, 'weight') else 1024
         else:
-            head_dim = source_model.embed_dim if hasattr(source_model, 'embed_dim') else 1024
-            
-        self.head = nn.Linear(head_dim, n_classes if n_classes is not None else head_dim)
-        self.n_classes = n_classes if n_classes is not None else head_dim
+            h, score_delta = self.attn(
+                self.norm1(x), counter, ucb_enabled, ucb_count_scores, return_attn=False
+            )
+            x = x + self.drop_path1(self.ls1(h))
+            x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+            return x, score_delta
 
-        # Replace blocks with UCB versions
+
+# ---------------------------------------------------------
+# ViT WITH UCB + INPUT-AWARE INFERENCE (OPTION A)
+# ---------------------------------------------------------
+class ViT_UCB_Pruning(nn.Module):
+    def __init__(
+        self,
+        model_name,
+        pretrained,
+        n_classes,
+        keep_ratio,
+        beta=1.0,
+        exclude_cls=True,
+        input_aware_weight=0.7,  # Weight for input-aware scores (0=pure UCB, 1=pure input)
+    ):
+        """
+        Args:
+            input_aware_weight: Balance between input-aware and UCB scores
+                               0.0 = pure UCB (fastest, no first-block overhead)
+                               1.0 = pure input-aware (slowest, most adaptive)
+                               0.7 = balanced (recommended)
+        """
+        super().__init__()
+
+        backbone = timm.create_model(model_name, pretrained=pretrained, init_values=1e-5)
+        self.keep_ratio = keep_ratio
+        self.input_aware_weight = input_aware_weight
+
+        self.patch_embed = backbone.patch_embed
+        self.cls_token = backbone.cls_token
+        self.pos_embed = backbone.pos_embed
+        self.pos_drop = backbone.pos_drop
+        self.norm = backbone.norm
+
         self.blocks = nn.ModuleList([
-            UCBBlock(block, k=k, keep_ratio=keep_ratio, beta=beta, exclude_cls=exclude_cls) 
-            for block in source_model.blocks
+            UCBBlock(
+                blk,
+                keep_ratio=keep_ratio,
+                beta=beta,
+                exclude_cls=exclude_cls,
+            )
+            for blk in backbone.blocks
         ])
 
-        # Initialize UCB count buffer
-        num_layers = len(self.blocks)
-        num_heads = self.blocks[0].attn.num_heads
-        num_patches = self.pos_embed.shape[1]  # Total tokens including CLS
+        embed_dim = backbone.embed_dim
+        self.head = nn.Linear(embed_dim, n_classes)
 
-        # Buffer to track patch selection counts per layer and head
-        self.register_buffer("ucb_count_scores", torch.ones(num_layers, num_heads, num_patches))
+        L = len(self.blocks)
+        H = self.blocks[0].attn.num_heads
+        N = self.pos_embed.shape[1]
 
-    def forward(self, x: torch.Tensor, counter: int = 0, ucb_enabled: bool = True, labels: torch.Tensor = None):
+        self.register_buffer(
+            "ucb_count_scores", torch.ones(L, H, N)
+        )
+
+    # -----------------------------------------------------
+    # GLOBAL PRUNING (POST-TRAIN) - UCB Statistics Only
+    # -----------------------------------------------------
+    def get_top_k_patch_indices(self, keep_ratio):
+        """Get top-k patches based on UCB statistics accumulated during training."""
+        scores = self.ucb_count_scores[:, :, 1:].mean(dim=(0, 1))
+        k = max(1, int(scores.numel() * keep_ratio))
+        topk = torch.topk(scores, k).indices + 1
+        return torch.cat([torch.tensor([0], device=topk.device), topk]).sort().values
+
+    # -----------------------------------------------------
+    # INPUT-AWARE PRUNING (OPTION A)
+    # -----------------------------------------------------
+    def get_input_aware_indices(self, x):
+        """
+        Run first block to get input-specific attention, combine with UCB statistics.
+        
+        Cost: One full forward pass through first block.
+        Benefit: Input-adaptive patch selection for remaining 11 blocks.
+        """
+        with torch.no_grad():
+            # Run first block with all patches to get attention weights
+            _, _, attn_probs = self.blocks[0](
+                x,
+                counter=0,
+                ucb_enabled=False,
+                ucb_count_scores=self.ucb_count_scores[0],
+                return_attn=True
+            )
+            
+            # Extract CLS attention to all patches (average over batch and heads)
+            # attn_probs: [B, H, N, N]
+            cls_attn = attn_probs[:, :, 0, 1:].mean(dim=(0, 1))  # [N-1]
+        
+        # Get UCB global scores
+        global_scores = self.ucb_count_scores[:, :, 1:].mean(dim=(0, 1))  # [N-1]
+        
+        # Normalize scores to [0, 1] for fair weighting
+        cls_attn_norm = (cls_attn - cls_attn.min()) / (cls_attn.max() - cls_attn.min() + 1e-8)
+        global_scores_norm = (global_scores - global_scores.min()) / (global_scores.max() - global_scores.min() + 1e-8)
+        
+        # Combine: weighted sum
+        alpha = self.input_aware_weight
+        combined_scores = alpha * cls_attn_norm + (1 - alpha) * global_scores_norm
+        
+        # Select top-k patches
+        k_keep = max(1, int(combined_scores.numel() * self.keep_ratio))
+        _, topk = torch.topk(combined_scores, k_keep)
+        
+        # Return indices (CLS + selected patches)
+        final_idx = torch.cat([torch.tensor([0], device=x.device), topk + 1]).sort().values
+        return final_idx
+
+    # -----------------------------------------------------
+    # FORWARD
+    # -----------------------------------------------------
+    def forward(self, x, counter=0, ucb_enabled=True, labels=None):
+        # Patch embedding
         x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        cls = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls, x], dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        # Initial tokens before any pruning
-        initial_x = x
-        B, N_full, C = initial_x.shape # N_full includes CLS and all patches
-        
-        # Determine the set of tokens to process
-        # This mechanism is active ONLY during inference and if input_aware_extra_tokens > 0
-        # It corrects the global pruning based on input-specific attention.
-        # It does NOT update UCB counts.
-        if not self.training and self.input_aware_extra_tokens > 0:
-            # This input-aware correction is applied only during inference/evaluation
-            # to provide a lightweight, input-specific refinement to the
-            # globally learned UCB pruning. It avoids modifying UCB counts or
-            # interfering with training dynamics.
-            
-            # Use the external utility function to get the merged token indices
-            final_token_indices = get_input_aware_and_global_token_indices(
-                initial_x=initial_x,
-                first_block=self.blocks[0],
-                ucb_count_scores=self.ucb_count_scores,
-                pos_embed_shape=self.pos_embed.shape,
-                global_keep_ratio=self.keep_ratio if self.keep_ratio is not None else 0.5,
-                input_aware_extra_tokens=self.input_aware_extra_tokens,
-                get_global_pruning_indices_fn=get_global_pruning_indices # Pass the function
-            )
-            
-            # Apply physical pruning to the token sequence
-            x = torch.index_select(x, dim=1, index=final_token_indices)
-            
-            # When input-aware pruning is active, UCB pruning inside blocks is not needed
-            # as physical pruning is already applied.
-            ucb_enabled_for_blocks = False
-        else:
-            # If not in evaluation or input_aware_extra_tokens is 0,
-            # proceed with standard UCB pruning as configured.
-            final_token_indices = None # No initial physical pruning
-            ucb_enabled_for_blocks = ucb_enabled # Respect original ucb_enabled flag
-        
-        # Process through blocks with potentially pruned tokens or standard full tokens
-        for i, block in enumerate(self.blocks):
-            # If input-aware pruning happened, ucb_enabled_for_blocks is False.
-            # Otherwise, it uses the original ucb_enabled flag.
-            # In the main loop, we never need to return attn_probs.
-            x, score_delta = block(
-                x, 
-                counter=counter, 
-                ucb_enabled=ucb_enabled_for_blocks, # Use the determined ucb_enabled flag
-                ucb_count_score=self.ucb_count_scores[i],
-                return_attn_probs=False # Always False for the main loop blocks
-            )
-            
-            if score_delta is not None:
-                self.ucb_count_scores[i].data += score_delta.data
+        # ---------------------------------------------
+        # INFERENCE: INPUT-AWARE PRUNING (OPTION A)
+        # ---------------------------------------------
+        if not self.training:
+            if self.input_aware_weight > 0.0:
+                # Option A: Run first block, then prune
+                # Cost: First block runs on all patches
+                # Benefit: Remaining blocks run on pruned patches
+                
+                # Step 1: Process first block with all patches
+                x, delta = self.blocks[0](
+                    x, 
+                    counter=counter, 
+                    ucb_enabled=False,  # No UCB masking during inference
+                    ucb_count_scores=self.ucb_count_scores[0]
+                )
+                
+                # Step 2: Get input-aware patch selection
+                final_idx = self.get_input_aware_indices(x)
+                
+                # Step 3: Prune patches
+                x = torch.index_select(x, dim=1, index=final_idx)
+                
+                # Step 4: Process remaining blocks (2-12) with pruned patches
+                for i in range(1, len(self.blocks)):
+                    x, delta = self.blocks[i](
+                        x, 
+                        counter=counter, 
+                        ucb_enabled=False,  # Already pruned
+                        ucb_count_scores=self.ucb_count_scores[i]
+                    )
+                    if delta is not None:
+                        with torch.no_grad():
+                            self.ucb_count_scores[i] += delta
+            else:
+                # Pure UCB mode (input_aware_weight=0): Maximum speed
+                final_idx = self.get_top_k_patch_indices(self.keep_ratio)
+                x = torch.index_select(x, dim=1, index=final_idx)
+                
+                # Process all blocks with pruned patches
+                for i, blk in enumerate(self.blocks):
+                    x, delta = blk(
+                        x, 
+                        counter=counter, 
+                        ucb_enabled=False,
+                        ucb_count_scores=self.ucb_count_scores[i]
+                    )
 
+        # ---------------------------------------------
+        # TRAINING: UCB SOFT PRUNING
+        # ---------------------------------------------
+        else:
+            for i, blk in enumerate(self.blocks):
+                x, delta = blk(x, counter, ucb_enabled, self.ucb_count_scores[i])
+                if delta is not None:
+                    with torch.no_grad():
+                        self.ucb_count_scores[i] += delta
+
+        # Classification head
         x = self.norm(x)
         logits = self.head(x[:, 0])
 
         if labels is not None:
-            loss = nn.CrossEntropyLoss()(logits, labels)
-            return loss, logits
+            return nn.CrossEntropyLoss()(logits, labels), logits
         return logits
-
-
-
-    def forward_pruned(self, x: torch.Tensor, top_k_indices: torch.Tensor):
-        x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = self.pos_drop(x + self.pos_embed)
-
-        # Physically prune the tokens based on the provided top_k_indices.
-        x = torch.index_select(x, dim=1, index=top_k_indices.to(x.device))
-
-        # Process the reduced set of tokens through the transformer blocks.
-        # UCB logic is disabled here since physical pruning has already occurred.
-        for i, block in enumerate(self.blocks):
-            x, _ = block(
-                x, 
-                counter=99999, # Dummy value, as ucb_enabled=False
-                ucb_enabled=False,  # Disable UCB updates/pruning within blocks
-                ucb_count_score=None # Not used when ucb_enabled=False
-            )
-            
-        # Final normalization and classification (CLS token is always at index 0 in the pruned sequence).
-        x = self.norm(x)
-        logits = self.head(x[:, 0])
-        
-        return logits
-
-    def get_pruning_stats(self):
-        """
-        Returns statistics about the current UCB pruning configuration and state.
-        This provides insights into the learned token importances.
-        """
-        stats = {
-            'num_layers': len(self.blocks),
-            'num_heads': self.blocks[0].attn.num_heads,
-            'total_tokens': self.pos_embed.shape[1], # Total tokens including CLS
-        }
-        
-        # Add per-layer pruning configuration based on the attention modules.
-        for i, block in enumerate(self.blocks):
-            # The `keep_ratio` or `k` attributes determine the pruning configuration.
-            if hasattr(block.attn, 'keep_ratio') and block.attn.keep_ratio is not None:
-                stats[f'layer_{i}_keep_ratio'] = block.attn.keep_ratio
-                # Calculate the number of tokens kept per layer (excluding CLS if specified).
-                stats[f'layer_{i}_kept_tokens'] = int(
-                    (self.pos_embed.shape[1] - (1 if block.attn.exclude_cls else 0)) * block.attn.keep_ratio
-                )
-            elif hasattr(block.attn, 'k') and block.attn.k is not None:
-                total_tokens_for_k = self.pos_embed.shape[1] - (1 if block.attn.exclude_cls else 0)
-                stats[f'layer_{i}_keep_ratio'] = block.attn.k / total_tokens_for_k
-                stats[f'layer_{i}_kept_tokens'] = block.attn.k
-                
-        # Add UCB statistics from the accumulated count scores.
-        stats['avg_token_counts'] = self.ucb_count_scores.mean(dim=(0, 1)).cpu().numpy()
-        stats['min_token_count'] = self.ucb_count_scores.min().item()
-        stats['max_token_count'] = self.ucb_count_scores.max().item()
-        
-        return stats

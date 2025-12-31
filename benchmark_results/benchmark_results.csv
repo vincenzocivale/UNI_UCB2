@@ -1,5 +1,0 @@
-checkpoint_path,keep_ratio,f1_score,avg_inference_time_ms
-/data/ucb_checkpoints/results2_freezed_0.3_lr/ratio_0.3/final_checkpoint/finetune-frozen-0.3_ratio_0.3.bin,0.3,0.8950055361505876,64.9942398048006
-/data/ucb_checkpoints/results2_freezed_0.5/ratio_0.5/final_checkpoint/finetune-frozen-0.5_ratio_0.5.bin,0.5,0.9111231764181319,105.53650076733902
-/data/ucb_checkpoints/results2_freezed_0.7_lr/ratio_0.7/final_checkpoint/finetune-frozen-0.7_ratio_0.7.bin,0.7,0.9190822361309399,142.97177229775116
-/data/ucb_checkpoints/results2_freezed_0.6_lr/ratio_0.6/final_checkpoint/finetune-frozen-0.6_ratio_0.6.bin,0.6,0.9188359667674935,126.37876865919678
