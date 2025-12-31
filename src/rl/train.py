@@ -283,7 +283,7 @@ class ModelTrainer:
         if self.model_type == "ucb":
             keep_ratio = getattr(self.model, 'keep_ratio', 1.0)
             
-            if training:
+            if phase == TrainingPhase.UCB_ESTIMATION:
                 # Training: usa UCB per esplorare e selezionare dinamicamente le patch
                 return self.model(x=inputs, labels=labels, counter=counter, ucb_enabled=True)
             else:
