@@ -144,7 +144,7 @@ class UCBBlock(nn.Module):
 
 
 # ---------------------------------------------------------
-# ViT WITH UCB + INPUT-AWARE INFERENCE (OPTION A)
+# ViT WITH UCB + INPUT-AWARE INFERENCE
 # ---------------------------------------------------------
 class ViT_UCB_Pruning(nn.Module):
     def __init__(

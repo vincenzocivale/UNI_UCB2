@@ -54,6 +54,12 @@ def main():
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Aggiorna il nome della run per includere i parametri
+    args.run_name = f"{args.run_name}-kr_{args.keep_ratio}-iaw_{args.input_aware_weight}"
+    if args.organ:
+        args.run_name += f"-{args.organ}"
+
+
     # --------------------------------------------------
     # DATASET + UNDERSAMPLING
     # --------------------------------------------------
