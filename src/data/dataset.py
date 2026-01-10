@@ -12,101 +12,121 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
+import pickle
+from pathlib import Path
 
 class PatchFromH5Dataset(Dataset):
     def __init__(self, h5_dir, transform=None, organ_filter=None):
         self.h5_dir = h5_dir
         self.transform = transform
         self.organ_filter = organ_filter
-
-        metadata = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_1_0.csv")
-        metadata["oncotree_code"] = metadata["oncotree_code"].fillna("Healthy").astype(str)
-        metadata["organ"] = metadata["organ"].astype(str)
-
-        # Map sample_id -> label_str e organ_str
-        self.sample_to_label_str = dict(zip(metadata["id"], metadata["oncotree_code"]))
-        self.sample_to_organ_str = dict(zip(metadata["id"], metadata["organ"]))
-
-        # Filtra sample_id in base all'organo
-        filtered_sample_ids = [
-            sample_id
-            for sample_id, organ in self.sample_to_organ_str.items()
-            if organ_filter is None or organ == organ_filter
-        ]
-
-        # Trova le classi presenti nel dataset filtrato
-        labels_in_filtered = set(self.sample_to_label_str[sid] for sid in filtered_sample_ids)
-        self.labels_str = sorted(labels_in_filtered)
-
-        # Ricostruisci mappa stringa->indice classi solo per quelle presenti
-        self.label_str_to_idx = {label: i for i, label in enumerate(self.labels_str)}
-
-        # Organ names e mappatura
-        organs_in_filtered = set(self.sample_to_organ_str[sid] for sid in filtered_sample_ids)
-        self.organ_names = sorted(organs_in_filtered)
-        self.organ_str_to_idx = {o: i for i, o in enumerate(self.organ_names)}
-
-        self.class_names = self.labels_str
-
-        self.data_index = []
-        self.labels = []
-        self.organs = []
-
-        for file in os.listdir(h5_dir):
-            if not file.endswith(".h5"):
-                continue
-
-            sample_id = file.replace(".h5", "")
-            if sample_id not in filtered_sample_ids:
-                continue
-
-            sample_organ = self.sample_to_organ_str[sample_id]
-            h5_path = os.path.join(h5_dir, file)
-            with h5py.File(h5_path, "r") as f:
-                n_patches = len(f["img"])
-
-            label_idx = self.label_str_to_idx[self.sample_to_label_str[sample_id]]
-            organ_idx = self.organ_str_to_idx[sample_organ]
-
-            for i in range(n_patches):
-                self.data_index.append((file, i))
-                self.labels.append(label_idx)
-                self.organs.append(organ_idx)
-
-        self.labels = np.array(self.labels, dtype=np.int64)
-        self.organs = np.array(self.organs, dtype=np.int64)
-
-        if organ_filter is not None:
-            print(
-                f"Dataset filtered on organ='{organ_filter}': "
-                f"{len(self.labels)} patches, {len(self.labels_str)} classes"
-            )
-
-
-
+        
+        # Cache file per l'indice
+        cache_file = Path(h5_dir) / f"index_cache_{organ_filter}.pkl"
+        
+        # Prova a caricare cache
+        if cache_file.exists():
+            print(f"Loading cached index from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                cached = pickle.load(f)
+                self.__dict__.update(cached)
+        else:
+            # Costruisci indice (codice originale)
+            metadata = pd.read_csv("hf://datasets/MahmoodLab/hest/HEST_v1_1_0.csv")
+            metadata["oncotree_code"] = metadata["oncotree_code"].fillna("Healthy").astype(str)
+            metadata["organ"] = metadata["organ"].astype(str)
+            
+            self.sample_to_label_str = dict(zip(metadata["id"], metadata["oncotree_code"]))
+            self.sample_to_organ_str = dict(zip(metadata["id"], metadata["organ"]))
+            
+            filtered_sample_ids = [
+                sample_id for sample_id, organ in self.sample_to_organ_str.items()
+                if organ_filter is None or organ == organ_filter
+            ]
+            
+            labels_in_filtered = set(self.sample_to_label_str[sid] for sid in filtered_sample_ids)
+            self.labels_str = sorted(labels_in_filtered)
+            self.label_str_to_idx = {label: i for i, label in enumerate(self.labels_str)}
+            
+            organs_in_filtered = set(self.sample_to_organ_str[sid] for sid in filtered_sample_ids)
+            self.organ_names = sorted(organs_in_filtered)
+            self.organ_str_to_idx = {o: i for i, o in enumerate(self.organ_names)}
+            self.class_names = self.labels_str
+            
+            self.data_index = []
+            self.labels = []
+            self.organs = []
+            
+            for file in os.listdir(h5_dir):
+                if not file.endswith(".h5"):
+                    continue
+                sample_id = file.replace(".h5", "")
+                if sample_id not in filtered_sample_ids:
+                    continue
+                
+                sample_organ = self.sample_to_organ_str[sample_id]
+                h5_path = os.path.join(h5_dir, file)
+                with h5py.File(h5_path, "r") as f:
+                    n_patches = len(f["img"])
+                
+                label_idx = self.label_str_to_idx[self.sample_to_label_str[sample_id]]
+                organ_idx = self.organ_str_to_idx[sample_organ]
+                
+                for i in range(n_patches):
+                    self.data_index.append((file, i))
+                    self.labels.append(label_idx)
+                    self.organs.append(organ_idx)
+            
+            self.labels = np.array(self.labels, dtype=np.int64)
+            self.organs = np.array(self.organs, dtype=np.int64)
+            
+            # Salva cache
+            print(f"Saving index cache to {cache_file}")
+            with open(cache_file, 'wb') as f:
+                pickle.dump({
+                    'data_index': self.data_index,
+                    'labels': self.labels,
+                    'organs': self.organs,
+                    'labels_str': self.labels_str,
+                    'label_str_to_idx': self.label_str_to_idx,
+                    'organ_names': self.organ_names,
+                    'organ_str_to_idx': self.organ_str_to_idx,
+                    'class_names': self.class_names,
+                    'sample_to_label_str': self.sample_to_label_str,
+                    'sample_to_organ_str': self.sample_to_organ_str
+                }, f)
+        
+        # ⭐ MODIFICA CHIAVE: Cache dei file H5 aperti (uno per worker)
+        self._h5_cache = {}
+        
+        print(f"Dataset: {len(self.labels)} patches, {len(self.labels_str)} classes")
+    
     def __len__(self):
         return len(self.data_index)
-
+    
     def __getitem__(self, idx):
         file_name, patch_idx = self.data_index[idx]
-
-        h5_path = os.path.join(self.h5_dir, file_name)
-        with h5py.File(h5_path, "r") as f:
-            patch = f["img"][patch_idx]
-
+        
+        # ⭐ MODIFICA CHIAVE: Usa cache invece di aprire/chiudere ogni volta
+        if file_name not in self._h5_cache:
+            h5_path = os.path.join(self.h5_dir, file_name)
+            self._h5_cache[file_name] = h5py.File(h5_path, "r")
+        
+        h5_file = self._h5_cache[file_name]
+        patch = h5_file["img"][patch_idx]
+        
         patch = torch.tensor(patch, dtype=torch.float32)
-
         if patch.ndim == 2:
             patch = patch.unsqueeze(0)
         elif patch.shape[-1] == 3:
             patch = patch.permute(2, 0, 1)
-
+        
         if self.transform:
             patch = self.transform(patch)
-
+        
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         organ = torch.tensor(self.organs[idx], dtype=torch.long)
-
+        
         return patch, label, organ
 
     
