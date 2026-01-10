@@ -9,6 +9,7 @@ import os
 import math
 import logging
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass
 from tqdm.auto import tqdm
@@ -31,6 +32,13 @@ try:
     _WANDB_AVAILABLE = True
 except ImportError:
     _WANDB_AVAILABLE = False
+
+# --- fvcore (optional) ---
+try:
+    from fvcore.nn import FlopCountAnalysis
+    _FVCORE_AVAILABLE = True
+except ImportError:
+    _FVCORE_AVAILABLE = False
 
 @dataclass
 class TrainingArguments:
@@ -76,7 +84,8 @@ class ModelTrainer:
         test_dataloader: Optional[DataLoader] = None,
         class_names: Optional[List[str]] = None,
         optimizers: Tuple[Optional[Optimizer], Optional[_LRScheduler]] = (None, None),
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        organ: Optional[str] = None
     ):
         self.model = model
         self.args = args
@@ -115,8 +124,12 @@ class ModelTrainer:
             # Add model type to wandb config
             config = vars(self.args).copy()
             config['model_type'] = self.model_type
+
+            tags = [self.model_type]
+            if organ:
+                tags.append(organ)
             
-            wandb.init(project="vit-ucb-dynamic-pruning", name=self.args.run_name, config=config)
+            wandb.init(project="vit-ucb-dynamic-pruning", name=self.args.run_name, config=config, tags=tags)
             wandb.watch(self.model, log_freq=self.args.logging_steps)
 
         # Checkpoint management
@@ -158,7 +171,7 @@ class ModelTrainer:
             return 0.5 * (1.0 + math.cos(math.pi * progress))
         return LambdaLR(self.optimizer, lr_lambda)
 
-    def train(self, pruning_logging: bool = True):
+    def train(self, pruning_logging: bool = True, starting_step: int = 0):  # ✅ Aggiungi parametro
         logger.info("***** Starting Training *****")
         logger.info(f"  Num Epochs = {self.args.num_train_epochs}")
         logger.info(f"  Total optimization steps = {self.args.max_steps}")
@@ -166,17 +179,30 @@ class ModelTrainer:
         if hasattr(self.model, 'input_aware_weight'):
             logger.info(f"  Input-aware weight = {self.model.input_aware_weight}")
 
-        global_step = 0
+        global_step = starting_step  # ✅ PARTI DA QUI
+        
+        if starting_step > 0:
+            logger.info(f"  RESUMING from step {starting_step}")
+            logger.info(f"  Note: If this is an old checkpoint, optimizer/scheduler are reinitialized")
+        
         train_loss = 0.0
         self.model.train()
 
-        best_model_path = None
-        
+        steps_per_epoch = len(self.train_dataloader) // self.args.gradient_accumulation_steps
+        starting_epoch = starting_step // steps_per_epoch
+        steps_to_skip_in_first_epoch = starting_step % steps_per_epoch
+
+        if starting_step > 0:
+            logger.info(f"  📍 Starting from epoch {starting_epoch}, skipping first {steps_to_skip_in_first_epoch} steps")
+
         # Main training loop
-        for epoch in range(int(math.ceil(self.args.num_train_epochs))):
+        for epoch in range(starting_epoch, int(math.ceil(self.args.num_train_epochs))):
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{int(self.args.num_train_epochs)}", leave=False)
             
             for step, batch in enumerate(progress_bar):
+                # Salta gli step già completati nella prima epoca dopo resume
+                if epoch == starting_epoch and step < steps_to_skip_in_first_epoch:
+                    continue
                 # Pass global_step as counter for UCB
                 loss = self._training_step(batch, counter=global_step)
                 train_loss += loss.item()
@@ -250,7 +276,20 @@ class ModelTrainer:
             logger.info(f"Loading best model from {best_model_path} for final evaluation.")
             self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         
+        start_time = time.time()
         metrics, val_preds, val_labels = self.evaluate(counter=global_step, return_preds=True)
+        inference_time = time.time() - start_time
+        
+        metrics["eval/inference_time"] = inference_time
+        
+        if _FVCORE_AVAILABLE:
+            # Calcola FLOPS
+            inputs, _, _ = next(iter(self.eval_dataloader))
+            inputs = inputs.to(self.device)
+            flops = FlopCountAnalysis(self.model, inputs)
+            metrics["eval/flops"] = flops.total()
+            logger.info(f"FLOPs: {flops.total()}")
+
         self._log(metrics, step=global_step)
 
         if self.args.report_to == "wandb" and _WANDB_AVAILABLE:
@@ -266,7 +305,7 @@ class ModelTrainer:
 
     def _training_step(self, batch: tuple, counter: int) -> torch.Tensor:
         self.model.train()
-        inputs, labels = batch
+        inputs, labels, *_ = batch
         inputs, labels = inputs.to(self.device), labels.to(self.device)
         
         with autocast(enabled=self.args.fp16):
@@ -321,7 +360,7 @@ class ModelTrainer:
         all_preds, all_labels = [], []
 
         for batch in tqdm(self.eval_dataloader, desc="Evaluation", leave=False):
-            inputs, labels = batch
+            inputs, labels, *_ = batch
             inputs, labels = inputs.to(self.device), labels.to(self.device)
 
             with torch.no_grad(), autocast(enabled=self.args.fp16):
@@ -359,7 +398,7 @@ class ModelTrainer:
 
         all_preds, all_labels = [], []
         for batch in tqdm(self.test_dataloader, desc="Prediction", leave=False):
-            inputs, labels = batch
+            inputs, labels, *_ = batch
             inputs, labels = inputs.to(self.device), labels.to(self.device)
 
             with torch.no_grad(), autocast(enabled=self.args.fp16):
@@ -414,9 +453,7 @@ class ModelTrainer:
                 metrics_dict[f"pruning/ucb_layer_{layer_idx}_mean"] = layer_mean.item()
             
 
-            if _WANDB_AVAILABLE:
-                metrics_dict["pruning/ucb_selection_distribution"] = wandb.Histogram(ucb_scores.cpu().numpy())
-
+           
     def _log_random_metrics(self, metrics_dict: Dict):
         """Log Random pruning-specific metrics."""
         # For random pruning, we can log the pruning configuration

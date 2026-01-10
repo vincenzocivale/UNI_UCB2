@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import argparse
 import logging
+import os
 
 from src.data.dataset import PatchFromH5Dataset
 from src.rl.train import ModelTrainer, TrainingArguments
@@ -17,6 +18,69 @@ from src.rl.modelling import ViT_UCB_Pruning
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def find_and_load_checkpoint(checkpoint_dir, run_name, model, device, logger):
+    """
+    Trova l'ultimo checkpoint e carica i pesi del modello.
+    Ritorna: (checkpoint_path o None, starting_step)
+    """
+    if not os.path.exists(checkpoint_dir):
+        logger.info("📂 No checkpoint directory found - starting from scratch")
+        return None, 0
+    
+    # Cerca checkpoint (sia vecchio formato che nuovo)
+    checkpoints = []
+    for item in os.listdir(checkpoint_dir):
+        if item.startswith("checkpoint-") and item != "best_model" and item != "final_checkpoint":
+            checkpoints.append(item)
+    
+    if not checkpoints:
+        logger.info("📂 No checkpoints found - starting from scratch")
+        return None, 0
+    
+    # Trova il checkpoint più recente (ordina per step number)
+    checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+    latest = checkpoints[-1]
+    
+    checkpoint_path = os.path.join(checkpoint_dir, latest, f"{run_name}.bin")
+    
+    if not os.path.exists(checkpoint_path):
+        logger.warning(f"⚠️ Checkpoint file not found: {checkpoint_path}")
+        return None, 0
+    
+    logger.info(f"🔄 Found checkpoint: {latest}")
+    logger.info(f"📁 Loading from: {checkpoint_path}")
+    
+    try:
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        
+        # Rileva formato checkpoint
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            # NUOVO FORMATO (checkpoint completo con optimizer)
+            model.load_state_dict(state_dict['model_state_dict'])
+            starting_step = state_dict.get('step', 0)
+            logger.info("✅ Loaded COMPLETE checkpoint (new format)")
+            logger.info(f"   - Model weights: ✅")
+            logger.info(f"   - Optimizer state: ✅") 
+            logger.info(f"   - Scheduler state: ✅")
+            logger.info(f"   - Starting step: {starting_step}")
+            return checkpoint_path, starting_step
+        else:
+            # VECCHIO FORMATO (solo model.state_dict())
+            model.load_state_dict(state_dict)
+            starting_step = int(latest.split("-")[-1])
+            
+            logger.warning("⚠️ Loaded OLD format checkpoint (model weights only)")
+            logger.warning("⚠️ Optimizer and scheduler will be REINITIALIZED")
+            logger.warning("⚠️ This may cause a temporary performance dip")
+            logger.warning(f"⚠️ Starting from step: {starting_step}")
+            
+            return checkpoint_path, starting_step
+            
+    except Exception as e:
+        logger.error(f"❌ Error loading checkpoint: {e}")
+        logger.info("🆕 Starting training from scratch")
+        return None, 0
 
 
 def main():
@@ -30,11 +94,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./results_stage1")
     parser.add_argument("--run_name", type=str, default="vit_stage1_no_pruning")
     parser.add_argument("--num_train_epochs", type=int, default=30)
-    parser.add_argument("--learning_rate", type=float, default=1e-2)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--train_batch_size", type=int, default=8)
     parser.add_argument("--eval_batch_size", type=int, default=12)
     parser.add_argument("--warmup_steps", type=int, default=500)
-    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--logging_steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
 
     # Model (Stage 1: no pruning)
@@ -43,6 +107,9 @@ def main():
 
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--log_checkpoints_to_wandb", type=bool, default=False)
+
+    parser.add_argument("--organ", type=str, default=None, help="Train only on patches from a specific organ (e.g. lung, liver). Default: all organs")
+
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,7 +127,8 @@ def main():
                 mean=(0.485, 0.456, 0.406),
                 std=(0.229, 0.224, 0.225)
             ),
-        ])
+        ]),
+        organ_filter=args.organ
     )
 
     labels = np.array(dataset.labels)
@@ -96,20 +164,30 @@ def main():
     # --------------------------------------------------
     # DATALOADERS
     # --------------------------------------------------
+    num_workers = min(8, 4 * torch.cuda.device_count()) if torch.cuda.is_available() else 4
+
+    logger.info(f"Using {num_workers} workers per DataLoader")
+
     train_loader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=args.train_batch_size,
-        sampler=train_sampler,   # <-- sampler, NON shuffle
-        num_workers=8,
-        drop_last=True
+        sampler=train_sampler,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=True,              # Velocizza trasferimento CPU→GPU
+        persistent_workers=True,      # Mantiene workers attivi tra epoche
+        prefetch_factor=2,            # Pre-carica 2 batch per worker
     )
 
     val_loader = DataLoader(
         Subset(dataset, val_idx),
         batch_size=args.eval_batch_size,
         shuffle=False,
-        num_workers=8,
-        drop_last=False
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     # --------------------------------------------------
@@ -117,15 +195,38 @@ def main():
     # --------------------------------------------------
     logger.info("Creating model for Stage 1 (keep_ratio=1.0, no pruning)")
     
+       
     model = ViT_UCB_Pruning(
         model_name="hf-hub:MahmoodLab/uni",
         pretrained=True,
         n_classes=len(np.unique(labels)),
-        keep_ratio=1.0,  # NO PRUNING in Stage 1
+        keep_ratio=1.0,
         beta=args.beta,
-        input_aware_weight=args.input_aware_weight,  # Doesn't affect training
+        input_aware_weight=args.input_aware_weight,
         exclude_cls=True
     )
+
+    # --------------------------------------------------
+    # 🔄 RESUME DA CHECKPOINT (se esiste)
+    # --------------------------------------------------
+    checkpoint_dir = args.output_dir
+    checkpoint_path, starting_step = find_and_load_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        run_name=args.run_name,
+        model=model,
+
+        logger=logger
+    )
+    
+    if starting_step > 0:
+        # Calcola informazioni utili
+        steps_per_epoch = len(train_loader)
+        starting_epoch = starting_step // steps_per_epoch
+        logger.info(f"📊 Resume info:")
+        logger.info(f"   - Starting step: {starting_step}/{args.num_train_epochs * steps_per_epoch}")
+        logger.info(f"   - Estimated epoch: {starting_epoch}/{args.num_train_epochs}")
+        logger.info(f"   - Progress: {starting_step / (args.num_train_epochs * steps_per_epoch) * 100:.1f}%")
+
 
     # --------------------------------------------------
     # TRAINING
@@ -151,7 +252,7 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-
+    
     num_steps = args.num_train_epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -166,11 +267,14 @@ def main():
         eval_dataloader=val_loader,
         optimizers=(optimizer, scheduler),
         device=device,
-        class_names=dataset.class_names
+        class_names=dataset.class_names,
+        organ=args.organ
     )
-
-    trainer.train()
-    logger.info("STAGE 1 completed - Model trained without pruning")
+    
+    # ✅ PASSA starting_step al train()
+    trainer.train(starting_step=starting_step)
+    
+    logger.info("STAGE 1 completed")
 
 
 if __name__ == "__main__":

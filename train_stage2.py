@@ -49,6 +49,7 @@ def main():
 
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--log_checkpoints_to_wandb", type=bool, default=False)
+    parser.add_argument("--organ", type=str, default=None, help="Train only on patches from a specific organ (e.g. lung, liver). Default: all organs")
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -57,6 +58,7 @@ def main():
     # DATASET + UNDERSAMPLING
     # --------------------------------------------------
     logger.info("Loading dataset")
+
     dataset = PatchFromH5Dataset(
         h5_dir=args.h5_dir,
         transform=transforms.Compose([
@@ -65,57 +67,46 @@ def main():
                 mean=(0.485, 0.456, 0.406),
                 std=(0.229, 0.224, 0.225)
             ),
-        ])
+        ]),
+        organ_filter=args.organ
     )
 
-    labels = dataset.labels
-    df = pd.DataFrame({
-        "index": np.arange(len(labels)),
-        "label": labels
-    })
+    labels = np.array(dataset.labels)
+    indices = np.arange(len(labels))
 
-    # Undersampling
-    min_count = df["label"].value_counts().min()
-    logger.info(f"Undersampling to {min_count} samples per class")
-
-    undersampled_df = (
-        df.groupby("label", group_keys=False)
-          .apply(lambda x: x.sample(n=min_count, random_state=args.seed))
-          .reset_index(drop=True)
-    )
-
-    undersampled_indices = undersampled_df["index"].values
-    undersampled_labels = undersampled_df["label"].values
-
-    # Global shuffle
-    perm = np.random.RandomState(args.seed).permutation(len(undersampled_indices))
-    undersampled_indices = undersampled_indices[perm]
-    undersampled_labels = undersampled_labels[perm]
-
-    # Train/val split
+    # Train / Val split (stratified, full dataset)
     train_idx, val_idx = train_test_split(
-        undersampled_indices,
+        indices,
         test_size=0.3,
-        stratify=undersampled_labels,
+        stratify=labels,
         random_state=args.seed
     )
 
     logger.info(f"Train size: {len(train_idx)}, Val size: {len(val_idx)}")
 
+    num_workers = min(8, 4 * torch.cuda.device_count()) if torch.cuda.is_available() else 4
+    logger.info(f"Using {num_workers} workers per DataLoader")
+
     train_loader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=args.train_batch_size,
         shuffle=True,
-        num_workers=8,
-        drop_last=True
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     val_loader = DataLoader(
         Subset(dataset, val_idx),
         batch_size=args.eval_batch_size,
         shuffle=False,
-        num_workers=8,
-        drop_last=False
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     # --------------------------------------------------
@@ -181,7 +172,8 @@ def main():
         eval_dataloader=val_loader,
         optimizers=(optimizer, scheduler),
         device=device,
-        class_names=dataset.class_names
+        class_names=dataset.class_names,
+        organ=args.organ
     )
 
     trainer.train()
