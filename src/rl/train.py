@@ -52,12 +52,12 @@ class TrainingArguments:
     warmup_steps: int = 500
     train_batch_size: int = 64
     gradient_accumulation_steps: int = 1
-    evaluation_strategy: str = "steps"
+    evaluation_strategy: str = "epoch"  # Changed default to "epoch"
     eval_steps: int = 100
     eval_batch_size: int = 64
     logging_strategy: str = "steps"
     logging_steps: int = 50
-    save_strategy: str = "steps"
+    save_strategy: str = "epoch"  # Changed default to "epoch"
     save_steps: int = 100
     save_total_limit: Optional[int] = 2
     seed: int = 42
@@ -171,15 +171,17 @@ class ModelTrainer:
             return 0.5 * (1.0 + math.cos(math.pi * progress))
         return LambdaLR(self.optimizer, lr_lambda)
 
-    def train(self, pruning_logging: bool = True, starting_step: int = 0):  # ✅ Aggiungi parametro
+    def train(self, pruning_logging: bool = True, starting_step: int = 0):
         logger.info("***** Starting Training *****")
         logger.info(f"  Num Epochs = {self.args.num_train_epochs}")
         logger.info(f"  Total optimization steps = {self.args.max_steps}")
         logger.info(f"  Model type = {self.model_type}")
+        logger.info(f"  Save strategy = {self.args.save_strategy}")
+        logger.info(f"  Evaluation strategy = {self.args.evaluation_strategy}")
         if hasattr(self.model, 'input_aware_weight'):
             logger.info(f"  Input-aware weight = {self.model.input_aware_weight}")
 
-        global_step = starting_step  # ✅ PARTI DA QUI
+        global_step = starting_step
         
         if starting_step > 0:
             logger.info(f"  RESUMING from step {starting_step}")
@@ -195,14 +197,18 @@ class ModelTrainer:
         if starting_step > 0:
             logger.info(f"  📍 Starting from epoch {starting_epoch}, skipping first {steps_to_skip_in_first_epoch} steps")
 
+        best_model_path = None
+
         # Main training loop
         for epoch in range(starting_epoch, int(math.ceil(self.args.num_train_epochs))):
+            logger.info(f"***** Epoch {epoch + 1}/{int(self.args.num_train_epochs)} *****")
             progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {epoch + 1}/{int(self.args.num_train_epochs)}", leave=False)
             
             for step, batch in enumerate(progress_bar):
-                # Salta gli step già completati nella prima epoca dopo resume
+                # Skip already completed steps in first epoch after resume
                 if epoch == starting_epoch and step < steps_to_skip_in_first_epoch:
                     continue
+                
                 # Pass global_step as counter for UCB
                 loss = self._training_step(batch, counter=global_step)
                 train_loss += loss.item()
@@ -223,19 +229,20 @@ class ModelTrainer:
 
                     progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{self.scheduler.get_last_lr()[0]:.2e}", "step": global_step})
 
-                    # Logging
+                    # Logging (only during training, not at epoch end)
                     if global_step % self.args.logging_steps == 0:
                         metrics_to_log = {
                             "train/loss": train_loss / self.args.logging_steps,
                             "train/learning_rate": self.scheduler.get_last_lr()[0],
-                            "train/global_step": global_step
+                            "train/global_step": global_step,
+                            "train/epoch": epoch + 1
                         }
                         if pruning_logging:
                             self._log_pruning_metrics(metrics_to_log)
                         self._log(metrics_to_log, step=global_step)
                         train_loss = 0.0
 
-                    # Evaluation
+                    # Evaluation during epoch (only if strategy is "steps")
                     if self.args.evaluation_strategy == "steps" and global_step % self.args.eval_steps == 0:
                         metrics = self.evaluate(counter=global_step)
                         if self.args.save_best_model and self._check_for_improvement(metrics):
@@ -249,17 +256,32 @@ class ModelTrainer:
                             self.finalize_training(global_step, best_model_path=best_model_path)
                             return
 
-                    # Save checkpoint
+                    # Save checkpoint during epoch (only if strategy is "steps")
                     if self.args.save_strategy == "steps" and global_step % self.args.save_steps == 0:
                         self._save_checkpoint(global_step)
 
+            # End of epoch: evaluation and checkpoint saving
+            logger.info(f"***** End of Epoch {epoch + 1} *****")
+            
+            # Evaluation at end of epoch
             if self.args.evaluation_strategy == "epoch":
                 metrics = self.evaluate(counter=global_step)
+                metrics["train/epoch"] = epoch + 1
+                
+                if self.args.save_best_model and self._check_for_improvement(metrics):
+                    self._save_checkpoint(global_step, is_best=True, epoch=epoch + 1)
+                    best_model_path = os.path.join(self.args.output_dir, "best_model", f"{self.args.run_name}.bin")
+                
                 self._log(metrics, step=global_step)
+                
                 if self._check_early_stopping():
                     logger.info("Early stopping triggered. Stopping training.")
                     self.finalize_training(global_step, best_model_path=best_model_path)
                     return
+            
+            # Save checkpoint at end of epoch
+            if self.args.save_strategy == "epoch":
+                self._save_checkpoint(global_step, epoch=epoch + 1)
             
             if global_step >= self.args.max_steps:
                 break
@@ -283,7 +305,7 @@ class ModelTrainer:
         metrics["eval/inference_time"] = inference_time
         
         if _FVCORE_AVAILABLE:
-            # Calcola FLOPS
+            # Calculate FLOPs
             inputs, _, _ = next(iter(self.eval_dataloader))
             inputs = inputs.to(self.device)
             flops = FlopCountAnalysis(self.model, inputs)
@@ -484,11 +506,13 @@ class ModelTrainer:
                 )
             }, step=step)
 
-    def _save_checkpoint(self, step: int, final: bool = False, is_best: bool = False):
+    def _save_checkpoint(self, step: int, final: bool = False, is_best: bool = False, epoch: Optional[int] = None):
         if is_best:
             name = "best_model"
         elif final:
             name = "final_checkpoint"
+        elif epoch is not None:
+            name = f"checkpoint-epoch-{epoch}"
         else:
             name = f"checkpoint-{step}"
         
@@ -499,7 +523,7 @@ class ModelTrainer:
         logger.info(f"Saving model checkpoint to {output_path}")
         torch.save(self.model.state_dict(), ckpt_path)
         
-        # Gestisce il limite di checkpoint da salvare
+        # Manage checkpoint limit
         if self._checkpoints is not None and not is_best and not final:
             self._checkpoints.append(output_path)
             if len(self._checkpoints) > self.args.save_total_limit:
@@ -514,6 +538,7 @@ class ModelTrainer:
             aliases = []
             if final: aliases.append("final")
             if is_best: aliases.append("best")
+            if epoch is not None: aliases.append(f"epoch-{epoch}")
             self._log_artifact_to_wandb(name, ckpt_path, aliases)
     
     def _log_artifact_to_wandb(self, name: str, path: str, aliases: List[str]):
