@@ -127,9 +127,11 @@ def stage1_train(args):
     )
     
     # Training args
+    dataset_name = args.dataset_name or Path(args.data_dir).name
     training_args = TrainingArguments(
         output_dir=args.output_dir / "stage1",
         run_name=f"{args.run_name}-stage1",
+        dataset_name=dataset_name,
         num_train_epochs=args.stage1_epochs,
         learning_rate=args.stage1_lr,
         train_batch_size=args.batch_size,
@@ -252,9 +254,11 @@ def stage2_train(args, stage1_checkpoint, n_classes):
     )
     
     # Training args
+    dataset_name = args.dataset_name or Path(args.data_dir).name
     training_args = TrainingArguments(
         output_dir=args.output_dir / f"stage2_kr{args.keep_ratio}",
         run_name=f"{args.run_name}-kr{args.keep_ratio}-iaw{args.input_aware_weight}",
+        dataset_name=dataset_name,
         num_train_epochs=args.stage2_epochs,
         learning_rate=args.stage2_lr,
         train_batch_size=args.batch_size,
@@ -299,6 +303,8 @@ def main():
     # Data - now just base directory
     parser.add_argument("--data_dir", type=str, required=True, 
                        help="Base dir with train/val/test subdirs (e.g., data/BACH)")
+    parser.add_argument("--dataset_name", type=str, default=None,
+                       help="Dataset name for W&B tag (default: extracted from data_dir)")
     parser.add_argument("--img_size", type=int, default=224)
     
     # Model

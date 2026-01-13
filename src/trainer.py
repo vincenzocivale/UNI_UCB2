@@ -1,6 +1,6 @@
 """
 Trainer for Vision Transformer with UCB-based Dynamic Pruning
-Clean implementation for publication
+Updated with dataset tagging for W&B
 """
 
 import torch
@@ -45,6 +45,7 @@ class TrainingArguments:
     # Paths
     output_dir: str
     run_name: str = "vit-pruning"
+    dataset_name: str = "unknown"  # For W&B tagging (e.g., "BACH", "CRC")
     
     # Training schedule
     num_train_epochs: int = 10
@@ -179,18 +180,23 @@ class ModelTrainer:
             config = vars(self.args).copy()
             config['model_type'] = self.model_type
             
+            # Create tags including dataset name
+            tags = [self.model_type, self.args.dataset_name]
+            
             wandb.init(
                 project="vit-ucb-pruning",
                 name=self.args.run_name,
                 config=config,
-                tags=[self.model_type]
+                tags=tags
             )
             wandb.watch(self.model, log_freq=self.args.logging_steps)
+            logger.info(f"W&B initialized with tags: {tags}")
     
     def train(self):
         """Main training loop"""
         logger.info("=" * 60)
         logger.info("Starting Training")
+        logger.info(f"  Dataset: {self.args.dataset_name}")
         logger.info(f"  Epochs: {self.args.num_train_epochs}")
         logger.info(f"  Steps: {self.total_steps}")
         logger.info(f"  Model: {self.model_type}")
@@ -385,16 +391,6 @@ class ModelTrainer:
             "train/step": step
         }
         
-        # # Add UCB-specific metrics
-        # if self.model_type == "ucb" and hasattr(self.model, 'ucb_count_scores'):
-        #     with torch.no_grad():
-        #         scores = self.model.ucb_count_scores.float()
-        #         metrics.update({
-        #             "pruning/ucb_mean": scores.mean().item(),
-        #             "pruning/ucb_std": scores.std().item(),
-        #             "pruning/ucb_sparsity": (scores == 0).float().mean().item()
-        #         })
-        
         self._log(metrics, step)
     
     def _log(self, metrics: Dict, step: int):
@@ -480,7 +476,7 @@ class ModelTrainer:
         if best_model_path and os.path.exists(best_model_path):
             self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         
-        # Test set evaluation (not val)
+        # Test set evaluation
         if self.test_dataloader:
             logger.info("Running final test evaluation")
             self.model.eval()
