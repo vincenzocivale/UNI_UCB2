@@ -334,7 +334,7 @@ def main():
     parser.add_argument("--run_name", type=str, default="ucb-vit")
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--report_to", type=str, default="wandb")
-    parser.add_argument("--early_stopping_patience", type=int, default=3)
+    parser.add_argument("--early_stopping_patience", type=int, default=5)
     
     # Other
     parser.add_argument("--seed", type=int, default=42)
