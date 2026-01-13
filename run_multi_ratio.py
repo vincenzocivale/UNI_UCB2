@@ -7,43 +7,43 @@ from pathlib import Path
 
 # Config
 DATA_DIR = "CRC-VAL-HE-7K"
-OUTPUT_DIR = "./results_multi_ratio2"
+OUTPUT_DIR = "./results_multi_ratio3"
 RUN_NAME = "ucb-vit-nct"
 BATCH_SIZE = 16
 NUM_WORKERS = 8
 
 # Stage 1
 STAGE1_EPOCHS = 20
-STAGE1_LR = 1e-3
+STAGE1_LR = 5e-3
 
 # Stage 2
-STAGE2_EPOCHS = 10
-STAGE2_LR = 5e-4
-KEEP_RATIOS = [0.4, 0.3, 0.2, 0.1]
-INPUT_AWARE_WEIGHT = 0.5
+STAGE2_EPOCHS = 15
+STAGE2_LR = 1e-3
+KEEP_RATIOS = [0.7, 0.5, 0.4, 0.3, 0.2, 0.1]
+INPUT_AWARE_WEIGHT = 0.2
 
 def run(cmd):
     print(f"\n>>> {' '.join(cmd[:5])}")
     subprocess.run(cmd, check=True)
 
-# # Stage 1
-# run([
-#     "python", "train_two_stage.py",
-#     "--data_dir", DATA_DIR,
-#     "--output_dir", OUTPUT_DIR,
-#     "--run_name", RUN_NAME,
-#     "--stage1_epochs", str(STAGE1_EPOCHS),
-#     "--stage1_lr", str(STAGE1_LR),
-#     "--stage2_epochs", str(STAGE2_EPOCHS),
-#     "--batch_size", str(BATCH_SIZE),
-#     "--num_workers", str(NUM_WORKERS),
-#     "--test_size", "0.15",  # 15% test, 15% val
-#     "--val_size", "0.15",
-#     "--warmup_steps", "500",
-#     "--weight_decay", "0.01",
-#     "--gradient_checkpointing",
-#     "--report_to", "wandb"
-# ])
+# Stage 1
+run([
+    "python", "train_two_stage.py",
+    "--data_dir", DATA_DIR,
+    "--output_dir", OUTPUT_DIR,
+    "--run_name", RUN_NAME,
+    "--stage1_epochs", str(STAGE1_EPOCHS),
+    "--stage1_lr", str(STAGE1_LR),
+    "--stage2_epochs", str(STAGE2_EPOCHS),
+    "--batch_size", str(BATCH_SIZE),
+    "--num_workers", str(NUM_WORKERS),
+    "--test_size", "0.15",  # 15% test, 15% val
+    "--val_size", "0.15",
+    "--warmup_steps", "500",
+    "--weight_decay", "0.01",
+    "--gradient_checkpointing",
+    "--report_to", "wandb"
+])
 
 stage1_ckpt = Path(OUTPUT_DIR) / "stage1" / "best_model" / f"{RUN_NAME}-stage1.bin"
 
